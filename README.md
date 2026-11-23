@@ -47,7 +47,7 @@ fineseed check more.fseed                            # unpack to a scratch folde
 
 ## Measured
 
-All numbers are real runs of `fineseed pack` on this machine (12 threads, level 3), sizes in decimal GB, "packed" is
+All numbers are real runs of `fineseed pack` on this machine with the default settings (zstd level 3), sizes in decimal GB, "packed" is
 the `.fseed` as a share of the input. Times include reading the model from a cold disk, so on big models they mostly
 measure the disk. The `.fseed` is lossless; unpack is checked against the BLAKE3 of the original.
 
@@ -61,8 +61,8 @@ measure the disk. The `.fseed` is lossless; unpack is checked against the BLAKE3
 | Goedel-Prover-8B | GGUF Q4_K_M | 5.03 GB | 4.82 GB, **95.9 %** | 133 s |
 | Goedel-Prover-8B | GGUF IQ3_XS | 3.63 GB | 3.52 GB, **97.1 %** | 103 s |
 
-BF16 weights land at 56 to 67 % (the floor for BF16 on its own is about 65 %; Qwen3 does better because part of its
-weights are more regular). Quantized GGUF is close to random bits, so entropy coding cannot do more than 3 to 4 %.
+BF16 weights land at 56 to 67 % (the floor for BF16 on its own is about 65 %; why Qwen3-1.7B goes lower is not
+investigated). Quantized GGUF is close to random bits, so entropy coding cannot do more than 3 to 4 %.
 zstd alone on BF16 gives about 77 %.
 
 ### Many models, one file

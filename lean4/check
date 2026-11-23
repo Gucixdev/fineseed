@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Builds the model, audits its axioms and scans the sources, as devframework's lean steps do.
+cd "$(dirname "$0")" || exit 1
+PATH="$HOME/.elan/bin:$PATH"
+fail=0
+if lake build > .build.log 2>&1; then echo "  ok   lake build"; else tail -20 .build.log; echo "  FAIL lake build"; fail=1; fi
+if lake env lean Audit.lean > .audit.log 2>&1 \
+    && ! grep -qE 'sorryAx|Lean.ofReduceBool|Lean.trustCompiler' .audit.log \
+    && ! grep -qE 'error' .audit.log; then
+    echo "  ok   axiom audit: $(grep -c 'depends on axioms' .audit.log) theorems on propext, Classical.choice, Quot.sound at most"
+else cat .audit.log; echo "  FAIL axiom audit"; fail=1; fi
+if grep -nE '\b(sorry|admit|native_decide|bv_decide)\b|^[[:space:]]*axiom ' FineSplit.lean FineModel.lean Oracle.lean; then
+    echo "  FAIL source scan"; fail=1
+else echo "  ok   source scan: no sorry, admit, native_decide, bv_decide or axiom"; fi
+exit $fail

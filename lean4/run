@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# run - the Rust code of split.rs and planes.rs checked against the Lean model in FineSplit.lean and FineModel.lean:
+# a harness prints one line per operation for HARNESS SEED OPS, Oracle.lean replays the lines on the model, and the
+# outputs must be identical. The steps are devframework's (src/test/steps.sh); `check` builds and audits the proofs.
+# 0 arguments.
+SEEDS=${SEEDS:-100} OPS=${OPS:-1000} FUZZ_SECS=${FUZZ_SECS:-10}
+. "${DEVFRAMEWORK:-$(cd "$(dirname "$0")/../.." && pwd)/devframework}/src/test/steps.sh" || exit 2
+diff_test harness/rust.rs oracle
+fuzz_diff
+lean_end

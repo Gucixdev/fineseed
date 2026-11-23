@@ -1,0 +1,10 @@
+name = "fineseedmodel"
+defaultTargets = ["FineSeedModel", "oracle"]
+
+[[lean_lib]]
+name = "FineSeedModel"
+roots = ["FineSplit", "FineModel"]
+
+[[lean_exe]]
+name = "oracle"
+root = "Oracle"

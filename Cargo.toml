@@ -1,0 +1,15 @@
+[package]
+name = "fineseed"
+version = "0.1.0"
+edition = "2024"
+description = "Lossless packer for machine learning model files: byte planes per dtype, delta against a base model, zstd"
+license = "MIT"
+
+[dependencies]
+blake3 = "1"
+serde_json = "1"
+zstd = "0.14"
+
+[profile.release]
+opt-level = 3
+debug = false

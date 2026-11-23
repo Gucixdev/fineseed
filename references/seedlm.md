@@ -4,4 +4,4 @@ SeedLM (arXiv 2410.10714, ICLR 2025): each block of weights is stored as the see
 coefficients, and rebuilt with an LFSR at inference. It is LOSSY (a quantization method) and data-free.
 
 Take: nothing for the lossless core. If he wants a lossy mode, it is a separate command and a separate decision, and
-every lossy step needs a before/after generation check (his lobotomy rule).
+every lossy step needs a before/after generation check (the project rule: never trust size or sparsity alone).

@@ -10,8 +10,8 @@ Features he lists, and what fineseed does with each:
 - independent chunks of about 1 MiB, so one tensor or byte range decodes alone, in parallel -> take (fineseed blocks are 32 MiB
   and carry no index; random access needs an index and smaller chunks).
 - one container, many files, dedup by content hash across members; an F32 file that holds only F16 values shares storage with
-  its F16 sibling -> take (this is his "magazynuje wiele modeli jak zip").
+  its F16 sibling -> take (many models in one archive, like a zip).
 - delta blobs: finetune stored as XOR residual against its base, mode max -> have it per block; missing: auto base choice.
 - modes (balanced default, max for packs), edit/merge/compact/recover on a container, `--max-total-decoded` budget for
   containers from elsewhere (decompression-bomb guard) -> take the budget and the verify-before-replace habit.
-Benchmark against it: not done (installing it was blocked); needs his OK, numbers then go in re/vibemix.md.
+Benchmark against it: not done (installing it was blocked); not run; numbers belong here once it is.

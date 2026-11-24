@@ -8,6 +8,7 @@ const HELP: &str = "fineseed - lossless .zip for AI models (safetensors, GGUF, O
                                                   identical blocks are stored once, a fine-tune against the most similar
                                                   earlier tensor; a .fseed among the inputs is opened and its members
                                                   share all of that (nesting, built again byte for byte on unpack)
+  pack --fast                                     numbers get the own Huffman coder only, no zstd attempt: quicker, may cost a little ratio
   fineseed unpack IN.fseed [-o DIR]               every file under DIR (default .), each checked against its blake3
   fineseed check IN.fseed                         unpack to a scratch folder next to IN.fseed, verify, delete it
   fineseed list IN.fseed                          every entry, nested ones indented
@@ -79,6 +80,7 @@ fn run(args: &[String]) -> Res<()> {
                         .ok_or("--parity needs a percentage, 1 to 400")?,
                 )
             }
+            "--fast" => fineseed::FAST.store(true, std::sync::atomic::Ordering::Relaxed),
             "--name" => name = Some(it.next().ok_or("--name needs a name")?.clone()),
             "--cache" => {
                 cache = it

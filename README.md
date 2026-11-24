@@ -25,8 +25,8 @@ fineseed unpack all.fseed -o out/               # everything, each file verified
 fineseed check all.fseed                        # unpack to scratch, verify, clean up
 ```
 
-Streams work too, no temp file: `curl ... | fineseed pack - --dtype bf16 -o dump.fseed` (also `-o -` for stdout).
-`-l N` sets the zstd level (1 to 22, default 3). It never quantizes: it only compresses, losslessly.
+Streams work too: `curl ... | fineseed pack - --dtype bf16 -o dump.fseed` (also `-o -` for stdout).
+`-l N` sets the zstd level (1 to 22, default 3); `--fast` skips zstd on numbers. It never quantizes: it only compresses, losslessly.
 
 Protect an archive against bit rot (Reed-Solomon parity, like par2 but inside the file):
 
@@ -48,19 +48,26 @@ Real runs of `fineseed pack`, default settings, sizes in decimal GB, "packed" is
 | Goedel-Prover-8B | GGUF Q4_K_M | 5.03 GB | 4.82 GB, **95.9 %** |
 | Goedel-Prover-8B | GGUF IQ3_XS | 3.63 GB | 3.52 GB, **97.1 %** |
 
-Quantized GGUF is close to random bits, so nobody can do more than 3 to 4 % there. BF16 is where it pays.
-
+Quantized GGUF is close to random bits: 3 to 4 % is all there is. BF16 is where it pays.
 | many models in one archive | input | packed |
 |---|---|---|
 | Goedel-8B as safetensors **and** GGUF (same weights) | 32.77 GB | 10.92 GB, **33.3 %** (2nd copy costs 2 MB) |
 | Goedel-8B: safetensors BF16, GGUF BF16, Q4_K_M, IQ3_XS | 41.42 GB | 18.73 GB, **45.2 %** |
 | three unrelated models | 26.62 GB | 17.33 GB, **65.1 %** (nothing to share, nothing lost) |
 
-**Speed.** Pack, unpack and `cat` run as a pipeline over all cores. A synthetic 512 MiB BF16 safetensors packed in 2.5 s on 12 cores
-from RAM and came back byte for byte; unpack costs about 2 CPU-seconds per 512 MiB. Caveat: that machine was shared and
-swapping, so wall times varied a lot between runs, and on a spinning disk the disk is the limit (here about 17 MB/s).
-Opening an archive reads only its table: `list` took 1 ms, the first bytes of one member 0.7 s, a 64 KiB read through
-`mount` 43 ms.
+**Against the others, on BF16** (not the same machine or data, so read it as a ballpark):
+
+| | size | speed |
+|---|---|---|
+| zstd -3 (measured here, 512 MiB) | 78.0 % | - |
+| ZipNN (its README, one thread) | 66.3 % | 1120 MB/s pack, 1660 MB/s unpack |
+| DFloat11 (its README: "about 30 % smaller") | about 70 % | GPU decode |
+| fineseed (512 MiB synthetic BF16) | 66.2 % | about 96 MB/s per core, 170 with `--fast` |
+
+On one file fineseed is where ZipNN is: the mantissa is noise (the two bytes alone have 66.5 % of entropy), nobody goes
+much lower. What they do not do is the archive: shared blocks stored once across formats and models, a fine-tune coded
+against its base. All cores are used (512 MiB packed in 2.9 s on 12 cores with `--fast`), but ZipNN is faster per core,
+and on a spinning disk the disk is the limit. `list` took 1 ms, a 64 KiB read through `mount` 43 ms.
 
 ## What it does
 
@@ -74,11 +81,10 @@ Opening an archive reads only its table: `list` took 1 ms, the first bytes of on
 * **Many models, one file.** Identical blocks are stored once across members and formats; a tensor is coded against the
   most similar earlier one. A `.fseed` among the inputs is opened and nested (up to 16 levels), rebuilt byte for byte.
 * **Random access.** `cat`, `extract` and `mount` decode only the blocks a read touches, plus what those refer to.
-* **Library.** `fineseed::api` is bytes in, bytes out; hostile input gives an `Error`, never a panic.
-* **Proofs.** `lean4/` proves split, merge, XOR and block cutting round-trip and diffs the Rust code against the Lean oracle.
+* **Library and proofs.** `fineseed::api` is bytes in, bytes out, hostile input gives an `Error`, never a panic. `lean4/`
+  proves split, merge, XOR and block cutting round-trip and diffs the Rust code against the Lean oracle.
 
 ## Not done
-
 A mantissa-given-exponent context coder for BF16; anything KV-cache specific (a KV dump is just a stream split by dtype);
 FP8 splitting (no gain); TFLite and TensorFlow index readers (their tensors are found by sampling). The parity header
 (a few KiB at the end of a protected file) is detected when damaged but cannot be repaired. `mount` shows a nested `.fseed`
@@ -91,5 +97,4 @@ cargo build --release          # `mount` needs fusermount3; --no-default-feature
 cargo test --release
 ```
 
-Rust 2024. Dependencies: `blake3`, `serde_json`, `zstd`, `crc32fast`, `reed-solomon-simd`, `fuser` (for `mount`, optional).
-MIT licensed.
+Rust 2024, MIT. Dependencies: `blake3`, `serde_json`, `zstd`, `crc32fast`, `reed-solomon-simd`, `fuser` (`mount`, optional).

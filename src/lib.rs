@@ -112,6 +112,10 @@ fn read_at<R: Read + Seek>(file: &mut R, off: u64, len: u64) -> Res<Vec<u8>> {
     Ok(buf)
 }
 
+/// `--fast`: numeric planes get the own Huffman coder only (what ZipNN does), without the zstd attempt. The format does
+/// not change, every part says which coder made it; only the choice is narrower, so it can cost a little ratio.
+pub static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn code_plane(plane: &[u8], level: i32, plain: bool) -> Res<Part> {
     let table = huffman::table(plane);
     let est = table.size;
@@ -122,7 +126,8 @@ fn code_plane(plane: &[u8], level: i32, plain: bool) -> Res<Part> {
         bytes: Vec::new(),
     };
     let mut best_len = plane.len();
-    if plain || est < plane.len() - plane.len() / 50 {
+    let fast = FAST.load(std::sync::atomic::Ordering::Relaxed);
+    if plain || (!fast && est < plane.len() - plane.len() / 50) {
         let coded = io(zstd::bulk::compress(plane, level), "zstd")?;
         if coded.len() < best_len {
             best_len = coded.len();
@@ -146,6 +151,11 @@ fn code_plane(plane: &[u8], level: i32, plain: bool) -> Res<Part> {
     Ok(best)
 }
 
+/// What the planes of `data` would cost under an order-0 coder, without coding anything.
+fn estimate(data: &[u8], kind: u8) -> usize {
+    split::split(kind, data).iter().map(|p| huffman::table(p).size.min(p.len())).sum()
+}
+
 fn code_block(data: &[u8], kind: u8, level: i32) -> Res<Vec<Part>> {
     let streams = split::split(kind, data);
     streams
@@ -167,6 +177,11 @@ fn encode(plan: &Plan, data: &[u8], base: Option<&[u8]>, level: i32) -> Res<Enco
     if let (Some(base), Some((base_member, base_off))) = (base, plan.base) {
         let mut delta = data.to_vec();
         planes::xor_into(&mut delta, base);
+        // coding the delta in full costs as much as coding the block again, so look at the order-0 sizes of its planes
+        // first: a delta that does not even come close to what the block cost is noise (a base that is not a base)
+        if plan.kind != split::PLAIN && estimate(&delta, plan.kind) >= best.size() - best.size() / 50 {
+            return Ok(best);
+        }
         let parts = code_block(&delta, plan.kind, level)?;
         let candidate = Encoded {
             xor: true,

@@ -1,100 +1,95 @@
 # fineseed
 
-A lossless packer for AI model files. Whatever goes in comes back **byte for byte**; every unpack is checked against a
-BLAKE3 hash of the original and fails loudly instead of handing you a wrong file.
-
-It exists because model files are a bad fit for zip: the numbers inside are 2-byte floats whose first byte (sign and exponent)
-repeats a lot and whose second byte is noise. fineseed pulls those apart, codes each part on its own, and also looks for what
-several models share.
-
-## Use
-
-One file kind, `.fseed`, for one model or many, like a zip:
+**Like zip, but made for AI model files.** Same weights in, the exact same bytes out, just smaller. Every unpack is checked
+against a BLAKE3 hash of the original and fails loudly instead of handing you a wrong file.
 
 ```
-fineseed pack model.safetensors                      # -> model.safetensors.fseed
-fineseed pack models/ extra.onnx -o all.fseed        # many files or folders in one archive
-fineseed pack all.fseed new-model.gguf -o more.fseed # an .fseed is opened: its members share blocks with the rest
-fineseed list more.fseed                             # every entry, nested ones indented
-fineseed unpack more.fseed -o out/                   # every file, nested archives built again, each checked
-fineseed check more.fseed                            # unpack to a scratch folder, verify, delete it
-fineseed cat more.fseed models/a.gguf > a.gguf       # one entry to stdout, nothing else is decoded
-fineseed extract more.fseed models/a.gguf -o out/    # some entries (a folder or nested archive takes all under it)
-fineseed mount more.fseed /mnt/models                # read-only folder, a read decodes only what it touches
-fineseed protect more.fseed --parity 5               # Reed-Solomon parity behind the archive; scrub checks, repair fixes
-cat kv.bin | fineseed pack - --dtype bf16 -o kv.fseed  # a stream, no temp file
+fineseed pack Qwen3-1.7B.safetensors     # 4.06 GB -> 2.29 GB (56 %)
+fineseed unpack Qwen3-1.7B.safetensors.fseed
 ```
 
-`-l N` sets the zstd level (1 to 22, default 3). Quantizing is not what this does: it only compresses.
-## What it does
+**Why not just zip it?** A BF16 weight is two bytes: the first (sign and exponent) repeats a lot, the second is noise. zip
+mixes them (zstd alone gets about 77 %). fineseed pulls them apart, codes each on its own, and lands at 56 to 67 %. Keep the same
+model in several formats, quantizations or folders and it stores the shared part once: **Goedel-8B as safetensors and as
+GGUF costs 10.9 GB, not 32.8 GB raw.**
 
-* **Formats.** SafeTensors, GGUF (v2, v3) and ONNX (initializers) are read tensor by tensor, with bounds on every length.
-  Zip containers (DDUF, PyTorch) are opened and each stored entry is read as a file of its own. Every other file (TensorFlow data files, TFLite, npz, anything) is cut into blocks and each block is coded as
-  bfloat16, float16, float32 or plain bytes, whichever a 16 KiB sample of it says (a fast zstd stands in for the coder, so
-  text and code are not mistaken for weights). It still comes back exact, and a file that is not a model costs only the look.
-* **Split by what the bytes are.** BF16, F16 and F32 are cut so the exponent sits apart from the mantissa, integers by byte
-  plane, and every quantized ggml type this knows (Q4_0 to Q8_0, the K-quants Q2_K to Q6_K, the IQ types and TQ1_0/TQ2_0) by its fields (scales, mins, nibbles). A wrong
-  guess only costs ratio, never correctness: the split is bijective and every byte is covered exactly once.
-* **Own Huffman coder** next to zstd and "stored raw" (smallest wins per stream); each tensor is also tried as
-  `block XOR block of the most similar earlier tensor`.
-* **Archive of many models.** `pack` keeps a block identical to an earlier one (from any member, any format) only once, and
-  codes a tensor against the most similar earlier tensor of the same type and size, from any earlier member. So a GGUF of a
-  model already in the archive as SafeTensors costs almost nothing. The table of contents is at the end; `list` reads only that.
-* **Nesting.** A `.fseed` among the inputs is opened and its members become members of the new archive, so they share blocks
-  and references with everything else (a model that sits in two inner archives is stored once). Unpack builds the inner file again
-  byte for byte; packing proves it can (it builds every inner archive again and compares), and an inner file that would not
-  come back identical, because another version wrote it, is kept as plain bytes instead. Up to 16 levels.
-* **Random access.** `cat`, `extract` and `mount` (FUSE, feature `mount`, needs `fusermount3`; a nested `.fseed` is a folder)
-  read the table at the end, then only the blocks a read needs.
-* **Streams.** `pack -` reads standard input in 4 MiB pieces (typed by a sample or `--dtype`), `-o -` writes to standard
-  output. A KV cache dump is split like any BF16/F16/F32 data; nothing KV-specific.
-* **Bitrot.** `protect` appends Reed-Solomon parity (groups of 128 pieces of 64 KiB, a CRC32 per piece); `repair` rewrites
-  damaged pieces in place, each only after it matches its CRC. The header at the very end is not protected.
-* **Library.** `fineseed::api` is bytes in, bytes out (`compress`/`decompress` for a whole file, `encode_block`/`decode_block`
-  for one tensor with an optional reference), no files and no global state, hostile input gives an `Error`, never a panic.
-* **Proofs.** `lean4/` proves split, merge, XOR and block cutting round-trip and diffs the Rust code against the Lean oracle.
+## Try it
+
+```
+fineseed pack models/ extra.onnx -o all.fseed   # many files or folders in one archive
+fineseed list all.fseed                         # what is inside
+fineseed cat all.fseed models/a.gguf > a.gguf   # ONE file out, nothing else is decoded
+fineseed extract all.fseed models/a.gguf -o out/
+fineseed mount all.fseed /mnt/models            # browse it as a read-only folder (FUSE)
+fineseed unpack all.fseed -o out/               # everything, each file verified
+fineseed check all.fseed                        # unpack to scratch, verify, clean up
+```
+
+Streams work too, no temp file: `curl ... | fineseed pack - --dtype bf16 -o dump.fseed` (also `-o -` for stdout).
+`-l N` sets the zstd level (1 to 22, default 3). It never quantizes: it only compresses, losslessly.
+
+Protect an archive against bit rot (Reed-Solomon parity, like par2 but inside the file):
+
+```
+fineseed protect all.fseed --parity 5    # +5 %: survives damaged 64 KiB pieces anywhere
+fineseed scrub all.fseed                 # check every piece against its CRC32
+fineseed repair all.fseed                # rebuild damaged pieces in place
+```
 
 ## Measured
 
-All numbers are real runs of `fineseed pack` on this machine with the default settings (zstd level 3), sizes in decimal GB, "packed" is
-the `.fseed` as a share of the input. Times include reading the model from a cold disk, so on big models they mostly
-measure the disk. The `.fseed` is lossless; unpack is checked against the BLAKE3 of the original.
+Real runs of `fineseed pack`, default settings, sizes in decimal GB, "packed" is the `.fseed` as a share of the input.
 
-### One model, one file
-
-| model | format | size | packed | time |
-|---|---|---|---|---|
-| Qwen3-1.7B | safetensors BF16 | 4.06 GB | 2.29 GB, **56.3 %** | 48 s |
-| Qwen2.5-3B | safetensors BF16 | 6.17 GB | 4.13 GB, **66.9 %** | 125 s |
-| Goedel-Prover-8B | safetensors BF16 | 16.38 GB | 10.91 GB, **66.6 %** | 405 s |
-| Goedel-Prover-8B | GGUF Q4_K_M | 5.03 GB | 4.82 GB, **95.9 %** | 133 s |
-| Goedel-Prover-8B | GGUF IQ3_XS | 3.63 GB | 3.52 GB, **97.1 %** | 103 s |
-
-BF16 weights land at 56 to 67 % (the floor for BF16 on its own is about 65 %; why Qwen3-1.7B goes lower is not
-investigated). Quantized GGUF is close to random bits, so entropy coding cannot do more than 3 to 4 %.
-zstd alone on BF16 gives about 77 %.
-
-### Many models, one file
-
-| in the archive | input | packed | vs. each packed alone |
+| model | format | size | packed |
 |---|---|---|---|
-| Goedel-8B BF16 as safetensors **and** as GGUF (same weights, two formats) | 32.77 GB | 10.92 GB, **33.3 %** | the second copy costs 2 MB |
-| Goedel-8B in four files: safetensors BF16, GGUF BF16, Q4_K_M, IQ3_XS | 41.42 GB | 18.73 GB, **45.2 %** | 19.25 GB alone, so 0.5 GB is shared even with the quantized ones |
-| Qwen3-1.7B + Qwen2.5-3B + Goedel-8B (three unrelated models) | 26.62 GB | 17.33 GB, **65.1 %** | 17.33 GB alone: nothing to share, and nothing lost |
+| Qwen3-1.7B | safetensors BF16 | 4.06 GB | 2.29 GB, **56.3 %** |
+| Qwen2.5-3B | safetensors BF16 | 6.17 GB | 4.13 GB, **66.9 %** |
+| Goedel-Prover-8B | safetensors BF16 | 16.38 GB | 10.91 GB, **66.6 %** |
+| Goedel-Prover-8B | GGUF Q4_K_M | 5.03 GB | 4.82 GB, **95.9 %** |
+| Goedel-Prover-8B | GGUF IQ3_XS | 3.63 GB | 3.52 GB, **97.1 %** |
 
-So an archive pays off when it holds the same weights more than once (another format, another quantization of the
-same model, a model that is in two folders); for unrelated models it is exactly the sum of the parts.
-Pack times for these three were 402 s, 509 s and 742 s.
+Quantized GGUF is close to random bits, so nobody can do more than 3 to 4 % there. BF16 is where it pays.
 
-## Not done yet
-A mantissa-given-exponent context coder for BF16, anything KV-cache specific, FP8 splitting (no ratio gain), "bonsai" (not
-identified), readers for TFLite and TensorFlow index files so their tensors are cut exactly instead of found by sampling.
+| many models in one archive | input | packed |
+|---|---|---|
+| Goedel-8B as safetensors **and** GGUF (same weights) | 32.77 GB | 10.92 GB, **33.3 %** (2nd copy costs 2 MB) |
+| Goedel-8B: safetensors BF16, GGUF BF16, Q4_K_M, IQ3_XS | 41.42 GB | 18.73 GB, **45.2 %** |
+| three unrelated models | 26.62 GB | 17.33 GB, **65.1 %** (nothing to share, nothing lost) |
+
+**Speed.** Pack, unpack and `cat` run as a pipeline over all cores. A synthetic 512 MiB BF16 safetensors packed in 2.5 s on 12 cores
+from RAM and came back byte for byte; unpack costs about 2 CPU-seconds per 512 MiB. Caveat: that machine was shared and
+swapping, so wall times varied a lot between runs, and on a spinning disk the disk is the limit (here about 17 MB/s).
+Opening an archive reads only its table: `list` took 1 ms, the first bytes of one member 0.7 s, a 64 KiB read through
+`mount` 43 ms.
+
+## What it does
+
+* **Formats.** SafeTensors, GGUF (v2, v3) and ONNX are read tensor by tensor, with bounds on every length. Zip containers
+  (DDUF, PyTorch `.pt`) are opened and each stored entry is read as a file of its own. Anything else (TensorFlow, TFLite,
+  npz, ...) is cut into blocks and each block is typed as BF16, F16, F32 or plain bytes from a 16 KiB sample.
+* **Split by what the bytes are.** BF16, F16, F32 by exponent and mantissa, integers by byte plane, and the ggml quant
+  types (Q4_0 to Q8_0, K-quants, IQ, TQ) by their fields. A wrong guess only costs ratio, never correctness.
+* **Own Huffman coder** next to zstd and "stored raw" (smallest wins per stream); each tensor is also tried as
+  `block XOR block of the most similar earlier tensor`, which is what makes fine-tunes small.
+* **Many models, one file.** Identical blocks are stored once across members and formats; a tensor is coded against the
+  most similar earlier one. A `.fseed` among the inputs is opened and nested (up to 16 levels), rebuilt byte for byte.
+* **Random access.** `cat`, `extract` and `mount` decode only the blocks a read touches, plus what those refer to.
+* **Library.** `fineseed::api` is bytes in, bytes out; hostile input gives an `Error`, never a panic.
+* **Proofs.** `lean4/` proves split, merge, XOR and block cutting round-trip and diffs the Rust code against the Lean oracle.
+
+## Not done
+
+A mantissa-given-exponent context coder for BF16; anything KV-cache specific (a KV dump is just a stream split by dtype);
+FP8 splitting (no gain); TFLite and TensorFlow index readers (their tensors are found by sampling). The parity header
+(a few KiB at the end of a protected file) is detected when damaged but cannot be repaired. `mount` shows a nested `.fseed`
+as a folder.
 
 ## Build and test
 
 ```
-cargo build --release
+cargo build --release          # `mount` needs fusermount3; --no-default-features skips it
 cargo test --release
 ```
 
-Rust 2024, dependencies: `blake3`, `serde_json`, `zstd`, `crc32fast`, `reed-solomon-simd`, `fuser` (for `mount`, optional).
+Rust 2024. Dependencies: `blake3`, `serde_json`, `zstd`, `crc32fast`, `reed-solomon-simd`, `fuser` (for `mount`, optional).
+MIT licensed.

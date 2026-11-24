@@ -513,3 +513,18 @@ mod archive {
         assert!(!out.join("ab").exists());
     }
 }
+
+/// F16 is cut as ZipNN does it: the high byte (sign, exponent, top mantissa bits) as one stream, the low byte as
+/// another. Cutting the sign and mantissa bits off the exponent cost 1 % of the size on SD 1.5.
+#[test]
+fn f16_is_a_high_byte_stream_and_a_low_byte_stream() {
+    use fineseed::split::{self, F16};
+    let data = [0x34, 0x12, 0xff, 0x7b, 0x00, 0x80, 0x01, 0x00];
+    assert_eq!(split::streams(F16), 2);
+    assert_eq!(split::lens(F16, 4), vec![4, 4]);
+    let planes = split::split(F16, &data);
+    assert_eq!(planes, vec![vec![0x12, 0x7b, 0x80, 0x00], vec![0x34, 0xff, 0x00, 0x01]]);
+    let mut back = vec![0u8; data.len()];
+    split::merge(F16, &planes, &mut back).unwrap();
+    assert_eq!(back, data);
+}

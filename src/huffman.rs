@@ -354,11 +354,111 @@ fn per_step(top: u32) -> usize {
     (57 / top) as usize
 }
 
+/// Bits one lookup of the multi-symbol table reads, and lookups per step. The exponent plane of a weight file has
+/// 2 to 3 bits of information per symbol, so a 12-bit window holds three symbols and one lookup gives all of them.
+/// A step reads 57 bits at least: every lookup uses at most `WIN`, and the one that meets a longer code (the slow
+/// path, up to 15 bits) ends the step.
+const WIN: u32 = 12;
+const STEPS: usize = 4;
+const _: () = assert!(STEPS as u32 * WIN <= 57 && (STEPS as u32 - 1) * WIN + MAX_LEN <= 57);
+/// Below this many symbols the table (4096 entries) costs more to build than it saves.
+const MULTI_FROM: usize = 1 << 16;
+const LONG: u32 = 0;
+const BAD: u32 = 1 << 31 | 1 << 28 | 1 << 24;
+
+/// The single-symbol table plus one that gives up to three symbols for each `WIN` bits: symbols in bytes 0 to 2, bits
+/// used in bits 24 to 27, the number of symbols in bits 28 and 29, bit 31 for bits no code starts with. `LONG` (zero)
+/// means the window starts a code longer than `WIN`.
+struct Multi {
+    tab: Box<[u32; 1 << WIN]>,
+    one: Box<[u16; TABLE_LEN]>,
+    top: u32,
+}
+
+fn multi_table(len: &[u8; 256]) -> Result<Multi, String> {
+    let (one, top) = decoding_table(len)?;
+    let mut tab: Box<[u32; 1 << WIN]> = vec![0u32; 1 << WIN].into_boxed_slice().try_into().map_err(|_| "table")?;
+    for (p, slot) in tab.iter_mut().enumerate() {
+        let (mut avail, mut used, mut count, mut syms, mut bad) = (WIN, 0u32, 0u32, 0u32, false);
+        while count < 3 {
+            // the bits still known, padded with zeros to the width of the single-symbol table: a code that is in
+            // them whole is the one at that index, whatever the padding is
+            let v = p & ((1 << avail) - 1);
+            let e = one[if avail >= top { v >> (avail - top) } else { v << (top - avail) }];
+            if e & (1 << 12) != 0 {
+                bad = count == 0;
+                break;
+            }
+            let l = u32::from(e & 15);
+            if l > avail {
+                break;
+            }
+            syms |= u32::from(e >> 4) << (8 * count);
+            avail -= l;
+            used += l;
+            count += 1;
+        }
+        *slot = if bad {
+            BAD
+        } else if count == 0 {
+            LONG
+        } else {
+            syms | used << 24 | count << 28
+        };
+    }
+    Ok(Multi { tab, one, top })
+}
+
+impl Lane<'_> {
+    /// Room for a step of `step_multi` without any check: up to three symbols for each lookup, and a four byte store.
+    #[inline(always)]
+    fn can_multi(&self) -> bool {
+        self.at + 3 * STEPS < self.out.len() && (self.bit >> 3) + 8 <= self.stream.len()
+    }
+
+    #[inline(always)]
+    fn step_multi(&mut self, m: &Multi) {
+        let b = self.bit >> 3;
+        let mut w = u64::from_be_bytes(self.stream[b..b + 8].try_into().unwrap_or([0; 8])) << (self.bit & 7);
+        let (mut used, mut at, mut bad) = (0usize, self.at, 0u32);
+        for _ in 0..STEPS {
+            let e = m.tab[(w >> (64 - WIN)) as usize & ((1 << WIN) - 1)];
+            if e == LONG {
+                let e1 = m.one[(w >> (64 - m.top)) as usize & (TABLE_LEN - 1)];
+                bad |= u32::from(e1 >> 12 & 1) << 31;
+                self.out[at] = (e1 >> 4) as u8;
+                at += 1;
+                used += usize::from(e1 & 15);
+                break;
+            }
+            bad |= e;
+            w <<= (e >> 24) & 15;
+            used += ((e >> 24) & 15) as usize;
+            // the fourth byte is not a symbol: it is written over by the next store or by `finish`
+            self.out[at..at + 4].copy_from_slice(&e.to_le_bytes());
+            at += ((e >> 28) & 3) as usize;
+        }
+        self.bit += used;
+        self.at = at;
+        self.bad |= bad >> 31;
+    }
+}
+
 /// Exactly `n` bytes, or an error on a damaged table or stream.
 pub fn decode(coded: &[u8], n: usize) -> Result<Vec<u8>, String> {
-    let (table, top) = decoding_table(&read_lengths(coded)?)?;
+    let len = read_lengths(coded)?;
     let mut out = vec![0u8; n];
-    Lane::new(&coded[TABLE_BYTES..], &mut out).finish(&table, top, per_step(top))?;
+    if n < MULTI_FROM {
+        let (table, top) = decoding_table(&len)?;
+        Lane::new(&coded[TABLE_BYTES..], &mut out).finish(&table, top, per_step(top))?;
+    } else {
+        let m = multi_table(&len)?;
+        let mut lane = Lane::new(&coded[TABLE_BYTES..], &mut out);
+        while lane.can_multi() && lane.bad == 0 {
+            lane.step_multi(&m);
+        }
+        lane.finish(&m.one, m.top, per_step(m.top))?;
+    }
     Ok(out)
 }
 
@@ -407,26 +507,39 @@ pub(crate) fn chunk_ranges(coded: &[u8], n: usize) -> Result<Vec<(usize, usize)>
 
 /// The inverse of `encode_chunked`: exactly `n` bytes, or an error on a damaged table or stream.
 pub fn decode_chunked(coded: &[u8], n: usize) -> Result<Vec<u8>, String> {
-    let (table, top) = decoding_table(&read_lengths(coded)?)?;
+    let len = read_lengths(coded)?;
     let ranges = chunk_ranges(coded, n)?;
     let mut out = vec![0u8; n];
+    let multi = if n >= MULTI_FROM { Some(multi_table(&len)?) } else { None };
+    let single = if multi.is_none() { Some(decoding_table(&len)?) } else { None };
     let mut lanes: Vec<Lane> = out
         .chunks_mut(CHUNK)
         .zip(&ranges)
         .map(|(dst, &(a, b))| Lane::new(&coded[a..b], dst))
         .collect();
-    let per = per_step(top);
     for group in lanes.chunks_mut(4) {
-        if let [a, b, c, d] = group {
+        if let (Some(m), [a, b, c, d]) = (&multi, &mut *group) {
+            while a.can_multi() && b.can_multi() && c.can_multi() && d.can_multi() {
+                a.step_multi(m);
+                b.step_multi(m);
+                c.step_multi(m);
+                d.step_multi(m);
+            }
+        } else if let (Some((table, top)), [a, b, c, d]) = (&single, &mut *group) {
+            let per = per_step(*top);
             while a.can(per) && b.can(per) && c.can(per) && d.can(per) {
-                a.step(&table, top, per);
-                b.step(&table, top, per);
-                c.step(&table, top, per);
-                d.step(&table, top, per);
+                a.step(table, *top, per);
+                b.step(table, *top, per);
+                c.step(table, *top, per);
+                d.step(table, *top, per);
             }
         }
         for lane in group {
-            lane.finish(&table, top, per)?;
+            match (&multi, &single) {
+                (Some(m), _) => lane.finish(&m.one, m.top, per_step(m.top))?,
+                (_, Some((table, top))) => lane.finish(table, *top, per_step(*top))?,
+                _ => {}
+            }
         }
     }
     drop(lanes);

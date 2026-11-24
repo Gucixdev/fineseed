@@ -63,12 +63,12 @@ Quantized GGUF is close to random bits: 3 to 4 % is all there is. BF16 is where 
 | zstd -3 (measured here, 512 MiB) | 78.0 % | - |
 | ZipNN (its README, one thread) | 66.3 % | 1120 MB/s pack, 1660 MB/s unpack |
 | DFloat11 (its README: "about 30 % smaller") | about 70 % | GPU decode |
-| fineseed (512 MiB synthetic BF16) | 66.2 % | per core: pack 200 MB/s (300 with `--fast`), unpack 400 |
+| fineseed (128 MiB synthetic BF16) | 66.2 % | one core: pack 320 MB/s (350 with `--fast`), unpack 670 |
 
-On one file fineseed is where ZipNN is: the mantissa is noise (the two bytes alone have 66.5 % of entropy), nobody goes
-much lower. What they do not do is the archive: shared blocks stored once across formats and models, a fine-tune coded
-against its base. All cores are used (512 MiB in about 3 s on 12 busy cores with `--fast`), but ZipNN is faster per
-core, and a spinning disk is the limit. `RUSTFLAGS="-C target-cpu=native"` makes the coder about 30 % faster.
+On one file fineseed is where ZipNN is: the mantissa is noise (the two bytes alone have 66.5 % of entropy). Side by side
+here (i7-8700, one core, SD 1.5 VAE in fp16): ZipNN 0.5.4 gives 85.0 % at 147 MB/s pack and 772 unpack, fineseed 85.4 %
+at 208 and 374 (hash check and file writes included). ZipNN has no archive: shared blocks across formats and models. Two
+different fine-tunes do not share much: SD 1.5 and dreamshaper-8 together come out 2.3 % under the two packed alone.
 
 ## What it does
 
@@ -78,7 +78,7 @@ core, and a spinning disk is the limit. `RUSTFLAGS="-C target-cpu=native"` makes
 * **Split by what the bytes are.** BF16, F16, F32 by exponent and mantissa, integers by byte plane, and the ggml quant
   types (Q4_0 to Q8_0, K-quants, IQ, TQ) by their fields. A wrong guess only costs ratio, never correctness.
 * **Own Huffman coder** next to zstd and "stored raw" (smallest wins per stream); each tensor is also tried as
-  `block XOR block of the most similar earlier tensor`, which is what makes fine-tunes small.
+  `block XOR block of the most similar earlier tensor`, which pays when a model is a small step from its base.
 * **Many models, one file.** Identical blocks are stored once across members and formats; a tensor is coded against the
   most similar earlier one. A `.fseed` among the inputs is opened and nested (up to 16 levels), rebuilt byte for byte.
 * **Random access.** `cat`, `extract` and `mount` decode only the blocks a read touches, plus what those refer to.

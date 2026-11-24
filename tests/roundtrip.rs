@@ -301,6 +301,71 @@ mod huffman {
             let _ = decode_chunked(&bad, n);
         }
     }
+
+    /// Planes of 64 Ki symbols and more take the multi-symbol table: three symbols for a 12-bit window, and a slow
+    /// path for codes longer than that. Both are compared with the input, in one stream and in chunks.
+    fn shuffled(mut data: Vec<u8>, seed: u64) -> Vec<u8> {
+        let r = lcg(seed, data.len() * 4);
+        for i in (1..data.len()).rev() {
+            let j = u32::from_le_bytes([r[4 * i], r[4 * i + 1], r[4 * i + 2], r[4 * i + 3]]) as usize % (i + 1);
+            data.swap(i, j);
+        }
+        data
+    }
+
+    fn big_planes() -> Vec<(&'static str, Vec<u8>)> {
+        // an exponent plane: a few dozen values, most of the weight on a handful
+        let expo: Vec<u8> = lcg(11, 300_001)
+            .iter()
+            .map(|&b| 0x70 + [0, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 8, 11, 17, 29, 40][(b & 15) as usize] + u8::from(b > 250))
+            .collect();
+        let mut fib = Vec::new();
+        let (mut a, mut b) = (1usize, 1usize);
+        for s in 0..26u8 {
+            fib.extend(std::iter::repeat_n(s, a));
+            let c = a + b;
+            a = b;
+            b = c;
+        }
+        vec![
+            ("five symbols", lcg(7, 200_003).iter().map(|b| 0x3c + (b % 5)).collect()),
+            ("exponent-like", expo),
+            ("codes of 15 bits", shuffled(fib, 5)),
+            ("noise", lcg(9, 131_077)),
+            ("one symbol", vec![9; 70_001]),
+            ("just past the limit", lcg(4, 65_536).iter().map(|b| b % 3).collect()),
+        ]
+    }
+
+    #[test]
+    fn multi_symbol_decoder_matches_the_input() {
+        for (name, data) in big_planes() {
+            let one = encode(&data).expect("non-empty");
+            assert_eq!(decode(&one, data.len()).expect("one stream"), data, "{name}");
+            let coded = chunked(&data);
+            assert_eq!(decode_chunked(&coded, data.len()).expect("chunks"), data, "{name}");
+        }
+    }
+
+    #[test]
+    fn multi_symbol_decoder_refuses_damage_and_never_panics() {
+        for (name, data) in big_planes() {
+            let n = data.len();
+            let coded = chunked(&data);
+            assert!(decode_chunked(&coded[..coded.len() - 40], n).is_err(), "{name}: cut short");
+            assert!(decode_chunked(&coded, n + 3 * fineseed::huffman::CHUNK).is_err(), "{name}: more than coded");
+            let one = encode(&data).expect("non-empty");
+            assert!(decode(&one, n + 70_000).is_err(), "{name}: one stream, more than coded");
+            for at in (128..coded.len()).step_by(4999) {
+                let mut bad = coded.clone();
+                bad[at] ^= 0x5a;
+                let _ = decode_chunked(&bad, n);
+                let mut bad = one.clone();
+                bad[at.min(one.len() - 1)] ^= 0x5a;
+                let _ = decode(&bad, n);
+            }
+        }
+    }
 }
 
 mod archive {

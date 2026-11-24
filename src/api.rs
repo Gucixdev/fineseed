@@ -308,54 +308,51 @@ pub fn decompress(coded: &[u8], reference: Option<&[u8]>, opt: &Options) -> Resu
     }
     // never trust the length in the header for an allocation: the output grows with the blocks actually read
     let mut out: Vec<u8> = Vec::new();
-    let mut left = h.blocks;
-    while left > 0 {
-        let n = (left as usize).min(workers_for(opt.threads));
-        let mut raws = Vec::with_capacity(n);
-        for _ in 0..n {
-            raws.push(read_block(&mut r).map_err(corrupt)?);
-        }
-        let mut bases: Vec<Option<&[u8]>> = Vec::with_capacity(n);
-        for raw in &raws {
-            bases.push(if raw.xor {
-                let b = reference
-                    .ok_or_else(|| Error::Reference("a block needs the reference".into()))?;
-                let end = raw
-                    .base_off
-                    .checked_add(raw.len as u64)
-                    .filter(|e| *e <= b.len() as u64);
-                Some(
-                    &b[raw.base_off as usize
-                        ..end.ok_or_else(|| {
-                            Error::Corrupt("a reference range past its end".into())
-                        })? as usize],
-                )
+    let threads = workers_for(opt.threads);
+    // a missing or too short reference is not damage to the stream: its message comes out as `Error::Reference`
+    let reference_error: std::sync::Mutex<Option<String>> = Default::default();
+    let ran = crate::pipe::run(
+        threads,
+        2 * threads,
+        (0..h.blocks).map(|_| read_block(&mut r)),
+        |_, raw| {
+            let base = if raw.xor {
+                let range = reference.and_then(|b| {
+                    let end = raw.base_off.checked_add(raw.len as u64).filter(|e| *e <= b.len() as u64)?;
+                    b.get(raw.base_off as usize..end as usize)
+                });
+                if range.is_none() {
+                    let why = if reference.is_none() {
+                        "a block needs the reference"
+                    } else {
+                        "a reference range past its end"
+                    };
+                    if let Ok(mut g) = reference_error.lock() {
+                        g.get_or_insert_with(|| why.to_string());
+                    }
+                    return Err(why.to_string());
+                }
+                range
             } else {
                 None
-            });
-        }
-        let decoded: Vec<Result<Vec<u8>, String>> = std::thread::scope(|s| {
-            let handles: Vec<_> = raws
-                .iter()
-                .zip(&bases)
-                .map(|(raw, b)| s.spawn(move || decode(raw, *b)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Err("a worker panicked".into())))
-                .collect()
-        });
-        for (raw, d) in raws.iter().zip(decoded) {
-            if raw.off != out.len() as u64 {
-                return Err(Error::Corrupt("blocks out of order".into()));
+            };
+            Ok((raw.off, decode(&raw, base)?))
+        },
+        |_, (off, bytes): (u64, Vec<u8>)| {
+            if off != out.len() as u64 {
+                return Err("blocks out of order".to_string());
             }
-            out.extend(d.map_err(corrupt)?);
+            out.extend(bytes);
             if out.len() as u64 > h.len {
-                return Err(Error::Corrupt("more bytes than the header says".into()));
+                return Err("more bytes than the header says".to_string());
             }
-        }
-        left -= n as u32;
+            Ok(())
+        },
+    );
+    if let Some(why) = reference_error.into_inner().ok().flatten() {
+        return Err(Error::Reference(why));
     }
+    ran.map_err(corrupt)?;
     if out.len() as u64 != h.len || blake3::hash(&out).as_bytes() != &h.hash {
         return Err(Error::Corrupt(
             "the bytes differ from the original (blake3 mismatch)".into(),

@@ -11,3 +11,4 @@ Small measuring tools, not part of the program. Each takes a model file: `cargo 
 | `phases` | time of each phase of coding one BF16 block: split, table, encode, decode, merge, BLAKE3, zstd |
 | `phases16` | the same for unpacking F16 data (high byte and low byte), decode best of five |
 | `gpu_huff` | chunked Huffman decode on the GPU against the CPU; needs `--features gpu` |
+| `memdec` | whole-file `api::compress` and `decompress` in memory, best of five; pin cores with `taskset` |

@@ -401,7 +401,7 @@ pub fn encode_auto(data: &[u8], reference: Option<&[u8]>, opt: &Options) -> Resu
             "the reference has not the length of the block".into(),
         ));
     }
-    let (code, shift) = split::guess(data);
+    let (code, shift) = crate::guess::guess(data);
     let kind = Kind(code);
     let unit = kind.unit();
     let n = (data.len().saturating_sub(shift) / unit) * unit;

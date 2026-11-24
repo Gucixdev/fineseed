@@ -7,7 +7,7 @@
 //!   (found by sampling): blocks become `block ^ reference block` where that is smaller, which is where a
 //!   fine-tune, a merge or a model of the same family pays off;
 //! * a file whose layout is not read (TensorFlow data files, TFLite, a PyTorch zip, anything) is cut into blocks and
-//!   each block is coded as bfloat16, float16, float32 or plain bytes, whichever a sample says (`split::guess`);
+//!   each block is coded as bfloat16, float16, float32 or plain bytes, whichever a sample says (`guess::guess`);
 //! * a member that is itself a `.fseed` is opened: its members become members of this archive (so they share
 //!   blocks and references with everything else), and the inner file is built again byte for byte when this archive
 //!   is unpacked. That is checked when packing; an inner file that does not come back identical (another version
@@ -265,7 +265,7 @@ fn auto_pieces(n: u64, kind: u8, shift: u64) -> Vec<(u64, u8)> {
 /// The sample of a block of `n` bytes that decides its type: from the middle, at a multiple of 8 so the alignment
 /// found holds for the block start. `(offset in the block, length)`.
 fn auto_sample(n: u64) -> (u64, u64) {
-    let s = n.min(split::GUESS_SAMPLE as u64);
+    let s = n.min(guess::GUESS_SAMPLE as u64);
     (((n - s) / 2) & !7, s)
 }
 
@@ -278,7 +278,7 @@ fn cut_auto(plans: &mut Vec<Plan>, f: &mut File, begin: u64, end: u64) -> Res<()
             cut(plans, at, at + n, split::PLAIN, None);
         } else {
             let (from, s) = auto_sample(n);
-            let (kind, shift) = split::guess(&read_at(f, at + from, s)?);
+            let (kind, shift) = guess::guess(&read_at(f, at + from, s)?);
             let mut p = at;
             for (len, k) in auto_pieces(n, kind, shift as u64) {
                 cut(plans, p, p + len, k, None);
@@ -347,7 +347,7 @@ impl<R: Read> Iterator for StreamJobs<R> {
                 None => {
                     let (from, s) = auto_sample(n);
                     let (kind, shift) =
-                        split::guess(&chunk[from as usize..(from + s) as usize]);
+                        guess::guess(&chunk[from as usize..(from + s) as usize]);
                     auto_pieces(n, kind, shift as u64)
                 }
             };

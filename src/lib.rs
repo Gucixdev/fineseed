@@ -18,6 +18,7 @@ pub mod format;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod gguf;
+pub mod guess;
 pub mod huffman;
 #[cfg(feature = "mount")]
 pub mod mount;

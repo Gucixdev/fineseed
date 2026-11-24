@@ -116,6 +116,21 @@ fn read_at<R: Read + Seek>(file: &mut R, off: u64, len: u64) -> Res<Vec<u8>> {
 /// not change, every part says which coder made it; only the choice is narrower, so it can cost a little ratio.
 pub static FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// zstd at 130 MB/s on an exponent plane costs more than everything else together, and on weights it rarely beats the
+/// order-0 coder. So look at a sample first: the full run is made only when the sample already codes smaller than the
+/// order-0 estimate says the whole plane will. Level 4 and up (the user asked for the best) always runs in full.
+fn zstd_may_win(plane: &[u8], est: usize, level: i32) -> bool {
+    const SAMPLE: usize = 128 << 10;
+    if level > 3 || plane.len() <= 4 * SAMPLE {
+        return true;
+    }
+    let mid = plane.len() / 2 - SAMPLE / 2;
+    let Ok(z) = zstd::bulk::compress(&plane[mid..mid + SAMPLE], level) else {
+        return true;
+    };
+    (z.len() as u128) * (plane.len() as u128) <= (est as u128) * (SAMPLE as u128)
+}
+
 fn code_plane(plane: &[u8], level: i32, plain: bool) -> Res<Part> {
     let table = huffman::table(plane);
     let est = table.size;
@@ -127,7 +142,7 @@ fn code_plane(plane: &[u8], level: i32, plain: bool) -> Res<Part> {
     };
     let mut best_len = plane.len();
     let fast = FAST.load(std::sync::atomic::Ordering::Relaxed);
-    if plain || (!fast && est < plane.len() - plane.len() / 50) {
+    if plain || (!fast && est < plane.len() - plane.len() / 50 && zstd_may_win(plane, est, level)) {
         let coded = io(zstd::bulk::compress(plane, level), "zstd")?;
         if coded.len() < best_len {
             best_len = coded.len();
@@ -138,10 +153,10 @@ fn code_plane(plane: &[u8], level: i32, plain: bool) -> Res<Part> {
         }
     }
     if est < best_len
-        && let Some(h) = huffman::encode_with(plane, &table).filter(|h| h.len() < best_len)
+        && let Some(h) = huffman::encode_chunked(plane, &table).filter(|h| h.len() < best_len)
     {
         best = Part {
-            method: 2,
+            method: 3,
             bytes: h,
         };
     }
@@ -448,6 +463,7 @@ fn decode(raw: &Raw, base: Option<&[u8]>) -> Res<Vec<u8>> {
             0 => std::borrow::Cow::Borrowed(bytes.as_slice()),
             1 => io(zstd::bulk::decompress(bytes, *want), "unzstd")?.into(),
             2 => huffman::decode(bytes, *want)?.into(),
+            3 => huffman::decode_chunked(bytes, *want)?.into(),
             _ => return Err("an unknown part method".into()),
         };
         if s.len() != *want {

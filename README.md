@@ -25,8 +25,8 @@ fineseed unpack all.fseed -o out/               # everything, each file verified
 fineseed check all.fseed                        # unpack to scratch, verify, clean up
 ```
 
-Streams work too: `curl ... | fineseed pack - --dtype bf16 -o dump.fseed` (also `-o -` for stdout).
-`-l N` sets the zstd level (1 to 22, default 3); `--fast` skips zstd on numbers. It never quantizes: it only compresses, losslessly.
+Streams work too: `curl ... | fineseed pack - --dtype bf16 -o dump.fseed` (also `-o -` for stdout). `-l N` sets the
+zstd level (1 to 22, default 3); `--fast` skips zstd on numbers. It never quantizes, it only compresses, losslessly.
 
 Protect an archive against bit rot (Reed-Solomon parity, like par2 but inside the file):
 
@@ -49,6 +49,7 @@ Real runs of `fineseed pack`, default settings, sizes in decimal GB, "packed" is
 | Goedel-Prover-8B | GGUF IQ3_XS | 3.63 GB | 3.52 GB, **97.1 %** |
 
 Quantized GGUF is close to random bits: 3 to 4 % is all there is. BF16 is where it pays.
+
 | many models in one archive | input | packed |
 |---|---|---|
 | Goedel-8B as safetensors **and** GGUF (same weights) | 32.77 GB | 10.92 GB, **33.3 %** (2nd copy costs 2 MB) |
@@ -62,12 +63,12 @@ Quantized GGUF is close to random bits: 3 to 4 % is all there is. BF16 is where 
 | zstd -3 (measured here, 512 MiB) | 78.0 % | - |
 | ZipNN (its README, one thread) | 66.3 % | 1120 MB/s pack, 1660 MB/s unpack |
 | DFloat11 (its README: "about 30 % smaller") | about 70 % | GPU decode |
-| fineseed (512 MiB synthetic BF16) | 66.2 % | about 96 MB/s per core, 170 with `--fast` |
+| fineseed (512 MiB synthetic BF16) | 66.2 % | per core: pack 200 MB/s (300 with `--fast`), unpack 400 |
 
 On one file fineseed is where ZipNN is: the mantissa is noise (the two bytes alone have 66.5 % of entropy), nobody goes
 much lower. What they do not do is the archive: shared blocks stored once across formats and models, a fine-tune coded
-against its base. All cores are used (512 MiB packed in 2.9 s on 12 cores with `--fast`), but ZipNN is faster per core,
-and on a spinning disk the disk is the limit. `list` took 1 ms, a 64 KiB read through `mount` 43 ms.
+against its base. All cores are used (512 MiB in about 3 s on 12 busy cores with `--fast`), but ZipNN is faster per
+core, and a spinning disk is the limit. `RUSTFLAGS="-C target-cpu=native"` makes the coder about 30 % faster.
 
 ## What it does
 
@@ -91,7 +92,6 @@ FP8 splitting (no gain); TFLite and TensorFlow index readers (their tensors are 
 as a folder.
 
 ## Build and test
-
 ```
 cargo build --release          # `mount` needs fusermount3; --no-default-features skips it
 cargo test --release

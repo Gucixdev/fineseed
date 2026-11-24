@@ -134,7 +134,7 @@ fn corrupt(e: String) -> Error {
 }
 
 /// One block: `kind u8`, `flags u8` (bit 0: xor with the reference), `len u32` little endian, then one part per
-/// stream of the kind: `method u8` (0 raw, 1 zstd, 2 huffman), `coded length u32`, bytes.
+/// stream of the kind: `method u8` (0 raw, 1 zstd, 2 huffman in one stream, 3 huffman in chunks), `coded length u32`, bytes.
 ///
 /// `data` is a whole number of values of `kind` and at most [`MAX_BLOCK`]. With a `reference` of the same length
 /// the block is also tried as `data ^ reference` and the smaller form kept; [`decode_block`] then needs the same

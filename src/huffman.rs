@@ -152,41 +152,88 @@ pub fn encode_with(data: &[u8], t: &Table) -> Option<Vec<u8>> {
     if data.is_empty() {
         return None;
     }
-    let len = &t.len;
-    let code = codes(len)?;
+    let sym = symbols(&t.len)?;
     let mut out = Vec::with_capacity(t.size.max(TABLE_BYTES) + 8);
+    header(&t.len, &mut out);
+    out.extend_from_slice(&encode_one(data, &sym));
+    Some(out)
+}
+
+fn header(len: &[u8; 256], out: &mut Vec<u8>) {
     for pair in len.as_chunks::<2>().0 {
         out.push(pair[0] | pair[1] << 4);
     }
-    // symbol code and length in one word, so the loop does one load per byte
+}
+
+/// Symbol code and length in one word (code << 8 | length), so the loop does one load per byte.
+fn symbols(len: &[u8; 256]) -> Option<[u32; 256]> {
+    let code = codes(len)?;
     let mut sym = [0u32; 256];
     for s in 0..256 {
         sym[s] = u32::from(code[s]) << 8 | u32::from(len[s]);
     }
-    // the low `nb` bits of `acc` are pending; 32 of them are written at once
-    let (mut acc, mut nb) = (0u64, 0u32);
-    for &b in data {
-        let e = sym[b as usize];
-        let l = e & 0xff;
-        acc = acc << l | u64::from(e >> 8);
-        nb += l;
-        if nb >= 32 {
-            out.extend_from_slice(&((acc >> (nb - 32)) as u32).to_be_bytes());
-            nb -= 32;
-        }
-    }
-    while nb >= 8 {
-        out.push((acc >> (nb - 8)) as u8);
-        nb -= 8;
-    }
-    if nb > 0 {
-        out.push(((acc << (8 - nb)) & 0xff) as u8);
-    }
-    Some(out)
+    Some(sym)
 }
 
-/// Exactly `n` bytes, or an error on a damaged table or stream.
-pub fn decode(coded: &[u8], n: usize) -> Result<Vec<u8>, String> {
+/// One stream: the bits most significant first, padded with zero bits.
+///
+/// Without a branch or a call in the loop: after every two symbols (at most 30 bits on top of 7 pending) the word
+/// `acc` is written at the byte where the pending bits start, and the position moves by the whole bytes. What sits
+/// past the position is stale and gets written over by the next word.
+fn encode_one(data: &[u8], sym: &[u32; 256]) -> Vec<u8> {
+    let mut out = vec![0u8; data.len() * 2 + 16];
+    let (mut acc, mut nb, mut pos) = (0u64, 0u32, 0usize);
+    // four codes of at most 14 bits and the 7 pending bits fit in 64; with longer codes it is two at a time
+    let quad = sym.iter().all(|e| e & 0xff <= 14);
+    let rest = if quad {
+        let (quads, rest) = data.as_chunks::<4>();
+        for q in quads {
+            let e = [sym[q[0] as usize], sym[q[1] as usize], sym[q[2] as usize], sym[q[3] as usize]];
+            acc = (((acc << (e[0] & 0xff) | u64::from(e[0] >> 8)) << (e[1] & 0xff) | u64::from(e[1] >> 8))
+                << (e[2] & 0xff)
+                | u64::from(e[2] >> 8))
+                << (e[3] & 0xff)
+                | u64::from(e[3] >> 8);
+            nb += (e[0] & 0xff) + (e[1] & 0xff) + (e[2] & 0xff) + (e[3] & 0xff);
+            out[pos..pos + 8].copy_from_slice(&acc.wrapping_shl(64 - nb).to_be_bytes());
+            pos += (nb >> 3) as usize;
+            nb &= 7;
+        }
+        rest
+    } else {
+        let (pairs, rest) = data.as_chunks::<2>();
+        for p in pairs {
+            let (e0, e1) = (sym[p[0] as usize], sym[p[1] as usize]);
+            let (l0, l1) = (e0 & 0xff, e1 & 0xff);
+            acc = (acc << l0 | u64::from(e0 >> 8)) << l1 | u64::from(e1 >> 8);
+            nb += l0 + l1;
+            out[pos..pos + 8].copy_from_slice(&acc.wrapping_shl(64 - nb).to_be_bytes());
+            pos += (nb >> 3) as usize;
+            nb &= 7;
+        }
+        rest
+    };
+    for &b in rest {
+        let e = sym[b as usize];
+        acc = acc << (e & 0xff) | u64::from(e >> 8);
+        nb += e & 0xff;
+        out[pos..pos + 8].copy_from_slice(&acc.wrapping_shl(64 - nb).to_be_bytes());
+        pos += (nb >> 3) as usize;
+        nb &= 7;
+    }
+    if nb > 0 {
+        out[pos] = (acc << (8 - nb)) as u8;
+        pos += 1;
+    }
+    out.truncate(pos);
+    out
+}
+
+/// Symbols per chunk of the chunked form. Each chunk is a stream of its own, so four of them decode side by side
+/// (four dependency chains instead of one) and a GPU can give each to a thread.
+pub const CHUNK: usize = 1 << 14;
+
+fn read_lengths(coded: &[u8]) -> Result<[u8; 256], String> {
     if coded.len() < TABLE_BYTES {
         return Err("huffman table cut short".into());
     }
@@ -195,73 +242,183 @@ pub fn decode(coded: &[u8], n: usize) -> Result<Vec<u8>, String> {
         len[2 * i] = b & 15;
         len[2 * i + 1] = b >> 4;
     }
-    let code = codes(&len).ok_or("huffman lengths overfill the code space")?;
-    // entry = symbol << 4 | length, 0 = no code
-    let mut table = vec![0u16; 1 << MAX_LEN];
+    Ok(len)
+}
+
+const TABLE_LEN: usize = 1 << MAX_LEN;
+/// An entry no code points at: one bit long and marked, so a step still moves on and the marker is read afterwards.
+const UNUSED: u16 = 1 << 12 | 1;
+
+/// The decoding table, indexed by the longest code in use, not by 15 bits: a mantissa plane needs 9 or 10 and the
+/// part of the table that is read then stays in the L1 cache. Entry = symbol << 4 | length, `UNUSED` for no code.
+/// Its size is fixed so that the index (masked with `TABLE_LEN - 1`) needs no bounds check.
+fn decoding_table(len: &[u8; 256]) -> Result<(Box<[u16; TABLE_LEN]>, u32), String> {
+    let code = codes(len).ok_or("huffman lengths overfill the code space")?;
+    let top = u32::from(len.iter().copied().max().unwrap_or(1)).max(1);
+    let mut table: Box<[u16; TABLE_LEN]> = vec![0u16; TABLE_LEN]
+        .into_boxed_slice()
+        .try_into()
+        .map_err(|_| "table")?;
+    table[..1 << top].fill(UNUSED);
     for s in 0..256 {
         let l = u32::from(len[s]);
         if l == 0 {
             continue;
         }
-        let lo = usize::from(code[s]) << (MAX_LEN - l);
-        let hi = lo + (1 << (MAX_LEN - l));
-        if hi > table.len() {
+        let lo = usize::from(code[s]) << (top - l);
+        let hi = lo + (1 << (top - l));
+        if hi > 1 << top {
             return Err("huffman code out of range".into());
         }
         table[lo..hi].fill((s as u16) << 4 | l as u16);
     }
-    let stream = &coded[TABLE_BYTES..];
+    Ok((table, top))
+}
+
+/// One stream being decoded into one slice. The state is the bit position alone: every step loads the eight bytes
+/// around it, which leave at least 57 bits, and takes `per` symbols from them, so there is no refill to wait for.
+struct Lane<'a> {
+    stream: &'a [u8],
+    out: &'a mut [u8],
+    bit: usize,
+    at: usize,
+    bad: u32,
+}
+
+impl<'a> Lane<'a> {
+    fn new(stream: &'a [u8], out: &'a mut [u8]) -> Self {
+        Lane {
+            stream,
+            out,
+            bit: 0,
+            at: 0,
+            bad: 0,
+        }
+    }
+
+    /// Room for a step without any check: eight bytes to read and `per` symbols to write.
+    #[inline(always)]
+    fn can(&self, per: usize) -> bool {
+        self.at + per <= self.out.len() && (self.bit >> 3) + 8 <= self.stream.len()
+    }
+
+    #[inline(always)]
+    fn step(&mut self, table: &[u16; TABLE_LEN], top: u32, per: usize) {
+        let b = self.bit >> 3;
+        let mut w = u64::from_be_bytes(self.stream[b..b + 8].try_into().unwrap_or([0; 8])) << (self.bit & 7);
+        let (mut used, mut bad) = (0usize, 0u16);
+        for o in &mut self.out[self.at..self.at + per] {
+            let e = table[(w >> (64 - top)) as usize & (TABLE_LEN - 1)];
+            let l = e & 15;
+            bad |= e;
+            w <<= l;
+            used += usize::from(l);
+            *o = (e >> 4) as u8;
+        }
+        self.bit += used;
+        self.at += per;
+        self.bad |= u32::from(bad >> 12 & 1);
+    }
+
+    /// The rest, with every code checked against the bits that are left.
+    fn finish(&mut self, table: &[u16; TABLE_LEN], top: u32, per: usize) -> Result<(), String> {
+        while self.can(per) && self.bad == 0 {
+            self.step(table, top, per);
+        }
+        if self.bad != 0 {
+            return Err("huffman stream damaged or cut short".into());
+        }
+        let total = self.stream.len() * 8;
+        while self.at < self.out.len() {
+            let b = self.bit >> 3;
+            let mut w = 0u64;
+            for i in 0..8 {
+                w = w << 8 | u64::from(self.stream.get(b + i).copied().unwrap_or(0));
+            }
+            w <<= self.bit & 7;
+            let e = table[(w >> (64 - top)) as usize & (TABLE_LEN - 1)];
+            let l = usize::from(e & 15);
+            if e & UNUSED & 1 << 12 != 0 || self.bit + l > total {
+                return Err("huffman stream damaged or cut short".into());
+            }
+            self.out[self.at] = (e >> 4) as u8;
+            self.at += 1;
+            self.bit += l;
+        }
+        Ok(())
+    }
+}
+
+/// The number of symbols a step takes: the 57 bits it has, over the longest code.
+fn per_step(top: u32) -> usize {
+    (57 / top) as usize
+}
+
+/// Exactly `n` bytes, or an error on a damaged table or stream.
+pub fn decode(coded: &[u8], n: usize) -> Result<Vec<u8>, String> {
+    let (table, top) = decoding_table(&read_lengths(coded)?)?;
     let mut out = vec![0u8; n];
-    // `buf` holds the next bits from its top; bits past `have` are the stream's next bits or zero
-    let (mut buf, mut have, mut pos, mut at) = (0u64, 0u32, 0usize, 0usize);
-    let mask = (1usize << MAX_LEN) - 1;
-    // fast: eight bytes in per refill leave at least 56 bits, so three symbols of at most 15 bits need no checks
-    while at + 3 <= n && pos + 8 <= stream.len() {
-        let w = u64::from_be_bytes([
-            stream[pos],
-            stream[pos + 1],
-            stream[pos + 2],
-            stream[pos + 3],
-            stream[pos + 4],
-            stream[pos + 5],
-            stream[pos + 6],
-            stream[pos + 7],
-        ]);
-        buf |= w >> have;
-        let adv = (63 - have) >> 3;
-        pos += adv as usize;
-        have += adv << 3;
-        let mut bad = 0u32;
-        for k in 0..3 {
-            let e = table[(buf >> (64 - MAX_LEN)) as usize & mask];
-            let l = u32::from(e & 15);
-            bad |= u32::from(l == 0);
-            buf <<= l;
-            have = have.wrapping_sub(l);
-            out[at + k] = (e >> 4) as u8;
-        }
-        if bad != 0 {
-            return Err("huffman stream damaged or cut short".into());
-        }
-        at += 3;
+    Lane::new(&coded[TABLE_BYTES..], &mut out).finish(&table, top, per_step(top))?;
+    Ok(out)
+}
+
+/// `encode_with` in chunks: the code lengths, then the byte length of each chunk (u32, little endian), then the
+/// chunks, each padded to a byte. The number of chunks is `n.div_ceil(CHUNK)` and the caller knows `n`.
+pub fn encode_chunked(data: &[u8], t: &Table) -> Option<Vec<u8>> {
+    if data.is_empty() {
+        return None;
     }
-    // slow: byte by byte, and a code longer than the bits left is an error
-    while at < n {
-        while have <= 56 && pos < stream.len() {
-            buf |= u64::from(stream[pos]) << (56 - have);
-            pos += 1;
-            have += 8;
-        }
-        let e = table[(buf >> (64 - MAX_LEN)) as usize & mask];
-        let l = u32::from(e & 15);
-        if l == 0 || l > have {
-            return Err("huffman stream damaged or cut short".into());
-        }
-        out[at] = (e >> 4) as u8;
-        at += 1;
-        buf <<= l;
-        have -= l;
+    let sym = symbols(&t.len)?;
+    let coded: Vec<Vec<u8>> = data.chunks(CHUNK).map(|c| encode_one(c, &sym)).collect();
+    let mut out = Vec::with_capacity(TABLE_BYTES + 4 * coded.len() + coded.iter().map(Vec::len).sum::<usize>());
+    header(&t.len, &mut out);
+    for c in &coded {
+        out.extend_from_slice(&(c.len() as u32).to_le_bytes());
     }
+    for c in &coded {
+        out.extend_from_slice(c);
+    }
+    Some(out)
+}
+
+/// The inverse of `encode_chunked`: exactly `n` bytes, or an error on a damaged table or stream.
+pub fn decode_chunked(coded: &[u8], n: usize) -> Result<Vec<u8>, String> {
+    let (table, top) = decoding_table(&read_lengths(coded)?)?;
+    let count = n.div_ceil(CHUNK);
+    let head = TABLE_BYTES + 4 * count;
+    if coded.len() < head {
+        return Err("huffman chunk lengths cut short".into());
+    }
+    let mut at = head;
+    let mut out = vec![0u8; n];
+    let mut lanes = Vec::with_capacity(count);
+    for (i, dst) in out.chunks_mut(CHUNK).enumerate() {
+        let l = u32::from_le_bytes(coded[TABLE_BYTES + 4 * i..][..4].try_into().unwrap_or([0; 4])) as usize;
+        let end = at
+            .checked_add(l)
+            .filter(|&e| e <= coded.len())
+            .ok_or("a huffman chunk runs past the part")?;
+        lanes.push(Lane::new(&coded[at..end], dst));
+        at = end;
+    }
+    if at != coded.len() {
+        return Err("a huffman part has bytes after its last chunk".into());
+    }
+    let per = per_step(top);
+    for group in lanes.chunks_mut(4) {
+        if let [a, b, c, d] = group {
+            while a.can(per) && b.can(per) && c.can(per) && d.can(per) {
+                a.step(&table, top, per);
+                b.step(&table, top, per);
+                c.step(&table, top, per);
+                d.step(&table, top, per);
+            }
+        }
+        for lane in group {
+            lane.finish(&table, top, per)?;
+        }
+    }
+    drop(lanes);
     Ok(out)
 }
 

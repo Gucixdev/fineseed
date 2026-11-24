@@ -174,7 +174,7 @@ fn a_damaged_seed_file_is_refused() {
 }
 
 mod huffman {
-    use fineseed::huffman::{decode, encode, estimate};
+    use fineseed::huffman::{decode, decode_chunked, encode, encode_chunked, estimate, table};
 
     fn lcg(seed: u64, n: usize) -> Vec<u8> {
         let mut x = seed;
@@ -247,6 +247,59 @@ mod huffman {
             decode(&coded, data.len() + 5000).is_err(),
             "asking for more than was coded"
         );
+    }
+
+    fn chunked(data: &[u8]) -> Vec<u8> {
+        encode_chunked(data, &table(data)).expect("non-empty")
+    }
+
+    #[test]
+    fn chunked_roundtrips_every_size_around_the_chunk_and_the_lane_group() {
+        let chunk = fineseed::huffman::CHUNK;
+        let skewed = |n| -> Vec<u8> { lcg(7, n).iter().map(|b| 0x3c + (b % 5)).collect() };
+        for n in [1, 2, 3, 63, chunk - 1, chunk, chunk + 1, 3 * chunk + 17, 4 * chunk, 4 * chunk + 1, 9 * chunk + 5] {
+            for data in [skewed(n), lcg(n as u64, n), vec![7; n]] {
+                let coded = chunked(&data);
+                assert_eq!(decode_chunked(&coded, n).expect("decodes"), data, "n = {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_roundtrips_codes_of_fifteen_bits() {
+        let mut data = Vec::new();
+        let (mut a, mut b) = (1usize, 1usize);
+        for s in 0..30u8 {
+            data.extend(std::iter::repeat_n(s, a));
+            let c = a + b;
+            a = b;
+            b = c;
+        }
+        let coded = chunked(&data);
+        assert_eq!(decode_chunked(&coded, data.len()).expect("decodes"), data);
+    }
+
+    #[test]
+    fn chunked_refuses_damaged_input_and_never_panics() {
+        let n = 5 * fineseed::huffman::CHUNK + 100;
+        let data: Vec<u8> = lcg(3, n).iter().map(|b| b % 11).collect();
+        let coded = chunked(&data);
+        assert!(decode_chunked(&coded[..100], n).is_err(), "table cut short");
+        assert!(decode_chunked(&coded[..140], n).is_err(), "chunk lengths cut short");
+        assert!(decode_chunked(&coded[..coded.len() - 40], n).is_err(), "last chunk cut short");
+        let mut more = coded.clone();
+        more.push(0);
+        assert!(decode_chunked(&more, n).is_err(), "bytes after the last chunk");
+        let mut lie = coded.clone();
+        lie[128..132].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_chunked(&lie, n).is_err(), "a chunk longer than the part");
+        assert!(decode_chunked(&coded, n + 3 * fineseed::huffman::CHUNK).is_err(), "more than was coded");
+        // flipped bytes may give wrong data (the archive's hash catches that) but never a panic
+        for at in (128..coded.len()).step_by(997) {
+            let mut bad = coded.clone();
+            bad[at] ^= 0xa5;
+            let _ = decode_chunked(&bad, n);
+        }
     }
 }
 

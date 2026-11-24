@@ -2,8 +2,10 @@
 //! back together. `kind` is one byte in the packed file:
 //!
 //! * `1..=8`: byte planes of `kind`-byte values (1 = the bytes as they are);
-//! * `10` BF16, `11` F16, `12` F32: the exponent as a stream of its own, then the rest of the float cut into
+//! * `10` BF16, `12` F32: the exponent as a stream of its own, then the rest of the float cut into
 //!   bytes (a float's exponent repeats, its mantissa is noise: kept apart each costs what it is worth);
+//! * `11` F16: the high byte (sign, exponent, top two mantissa bits) and the low byte, two streams. Cutting the
+//!   sign and mantissa bits off the exponent costs 1 % more (measured on SD 1.5), the bits tell about each other;
 //! * `64 + t`: a quantized GGUF block of ggml type `t`, cut by field: scales apart from the quantized values,
 //!   4-bit values one per symbol so that an order-0 coder sees their real, uneven distribution.
 //!
@@ -122,8 +124,7 @@ fn field_streams(f: &Field) -> usize {
 pub fn streams(kind: u8) -> usize {
     match kind {
         1..=8 => kind as usize,
-        BF16 => 2,
-        F16 => 3,
+        BF16 | F16 => 2,
         F32 => 4,
         k if k >= QUANT => {
             quant(u32::from(k - QUANT)).map_or(0, |q| q.fields.iter().map(field_streams).sum())
@@ -136,8 +137,7 @@ pub fn streams(kind: u8) -> usize {
 pub fn lens(kind: u8, n: usize) -> Vec<usize> {
     match kind {
         1..=8 => vec![n; kind as usize],
-        BF16 => vec![n; 2],
-        F16 => vec![n; 3],
+        BF16 | F16 => vec![n; 2],
         F32 => vec![n; 4],
         k if k >= QUANT => {
             let mut v = Vec::new();
@@ -196,22 +196,12 @@ pub fn split(kind: u8, data: &[u8]) -> Vec<Vec<u8>> {
             }
         }
         F16 => {
-            let [a, b, c] = out.get_disjoint_mut([0, 1, 2]).unwrap_or_else(|_| unreachable!());
+            let [a, b] = out.get_disjoint_mut([0, 1]).unwrap_or_else(|_| unreachable!());
             a.resize(n, 0);
             b.resize(n, 0);
-            c.resize(n, 0);
-            for (((v, e), s), m) in data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .zip(a.iter_mut())
-                .zip(b.iter_mut())
-                .zip(c.iter_mut())
-            {
-                let x = u16::from_le_bytes(*v);
-                *e = (x >> 10 & 0x1f) as u8;
-                *s = (x >> 15 << 2 | x >> 8 & 3) as u8;
-                *m = x as u8;
+            for ((v, h), l) in data.as_chunks::<2>().0.iter().zip(a.iter_mut()).zip(b.iter_mut()) {
+                *h = v[1];
+                *l = v[0];
             }
         }
         F32 => {
@@ -301,16 +291,8 @@ pub fn merge<S: AsRef<[u8]>>(kind: u8, streams_in: &[S], out: &mut [u8]) -> Resu
             }
         }
         F16 => {
-            for (((v, &e), &s), &m) in out
-                .as_chunks_mut::<2>()
-                .0
-                .iter_mut()
-                .zip(st[0])
-                .zip(st[1])
-                .zip(st[2])
-            {
-                let (e, s, m) = (u16::from(e), u16::from(s), u16::from(m));
-                *v = (s >> 2 << 15 | e << 10 | (s & 3) << 8 | m).to_le_bytes();
+            for ((v, &h), &l) in out.as_chunks_mut::<2>().0.iter_mut().zip(st[0]).zip(st[1]) {
+                *v = [l, h];
             }
         }
         F32 => {

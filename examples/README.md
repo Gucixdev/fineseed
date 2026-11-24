@@ -9,5 +9,5 @@ Small measuring tools, not part of the program. Each takes a model file: `cargo 
 | `fragments` | `api::encode_auto` on pieces cut at random places (64 to 256 KiB), against zstd level 3 |
 | `huff` | Huffman encode and decode speed per plane, one thread, single stream against chunks |
 | `phases` | time of each phase of coding one BF16 block: split, table, encode, decode, merge, BLAKE3, zstd |
-| `phases16` | the same for unpacking F16 data (three planes), decode best of five |
+| `phases16` | the same for unpacking F16 data (high byte and low byte), decode best of five |
 | `gpu_huff` | chunked Huffman decode on the GPU against the CPU; needs `--features gpu` |

@@ -41,7 +41,7 @@ def splitKind (k : Nat) (d : List Nat) : Option (List (List Nat)) :=
     some [vs.map (·.1), vs.map (·.2)]
   else if k = 11 then
     let vs := (values 2 d).map f16Enc
-    some [vs.map (·.1), vs.map (·.2.1), vs.map (·.2.2)]
+    some [vs.map (·.1), vs.map (·.2)]
   else if k = 12 then
     let vs := (values 4 d).map f32Enc
     some [vs.map (·.1), vs.map (·.2.1), vs.map (·.2.2.1), vs.map (·.2.2.2)]
@@ -53,7 +53,7 @@ def mergeKind (k n : Nat) (ss : List (List Nat)) : Option (List Nat) :=
   else if k = 10 then
     some ((List.range n).flatMap fun i => let p := bf16Dec (g 0 i) (g 1 i); [p.1, p.2])
   else if k = 11 then
-    some ((List.range n).flatMap fun i => bytesOf 2 (f16Dec (g 0 i) (g 1 i) (g 2 i)))
+    some ((List.range n).flatMap fun i => bytesOf 2 (f16Dec (g 0 i) (g 1 i)))
   else if k = 12 then
     some ((List.range n).flatMap fun i => bytesOf 4 (f32Dec (g 0 i) (g 1 i) (g 2 i) (g 3 i)))
   else none

@@ -16,7 +16,7 @@
 //! Both sharing kinds are restored by reading bytes of an already restored member, so `restore` writes members in
 //! order and every member's blake3 is checked after it is written.
 //!
-//! Layout, little endian: magic `FSEEDA\x03\0`, then the blocks of all members, then the table, then the table
+//! Layout, little endian: magic `FSEEDA\x04\0`, then the blocks of all members, then the table, then the table
 //! offset `u64` and the magic again. A block is `kind u8` (see `split`), `flags u8` (bit 0: xor with earlier
 //! bytes, bit 1: copy of earlier bytes), `offset u64`, `len u32`, `member u32` and `source offset u64` for each
 //! set flag (xor first), and unless bit 1 one part per stream: `method u8`, `coded length u32`, bytes.
@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-const AMAGIC: &[u8; 8] = b"FSEEDA\x03\0";
+const AMAGIC: &[u8; 8] = b"FSEEDA\x04\0";
 /// Deepest nesting of one `.fseed` in another that is read or written.
 pub const MAX_DEPTH: u32 = 16;
 /// A run of an unread layout shorter than this is stored as plain bytes without a look at its type.

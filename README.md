@@ -66,8 +66,8 @@ Quantized GGUF is close to random bits: 3 to 4 % is all there is. BF16 is where 
 | fineseed (128 MiB synthetic BF16) | 66.2 % | one core: pack 320 MB/s (350 with `--fast`), unpack 670 |
 
 On one file fineseed is where ZipNN is: the mantissa is noise (the two bytes alone have 66.5 % of entropy). Side by side
-here (i7-8700, one core, SD 1.5 VAE in fp16): ZipNN 0.5.4 gives 85.0 % at 147 MB/s pack and 772 unpack, fineseed 85.4 %
-at 208 and 374 (hash check and file writes included). ZipNN has no archive: shared blocks across formats and models. Two
+here (i7-8700, one core, SD 1.5 VAE in fp16): ZipNN 0.5.4 gives 85.0 % at 147 MB/s pack and 772 unpack, fineseed 84.9 %
+at 278 and 537 (hash check and file writes included). ZipNN has no archive: shared blocks across formats and models. Two
 different fine-tunes do not share much: SD 1.5 and dreamshaper-8 together come out 2.3 % under the two packed alone.
 
 ## What it does

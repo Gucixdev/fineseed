@@ -1,5 +1,5 @@
 //! Time of each phase of unpacking F16 data, one thread: `cargo run --release --example phases16 FILE [MiB]`.
-//! The three planes (exponent, sign and top mantissa bits, low mantissa byte) are coded and decoded one by one.
+//! The two planes (high byte, low byte) are coded and decoded one by one.
 use std::time::Instant;
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -31,7 +31,7 @@ fn main() {
         println!("decode plane {i}         {:7.1} MB/s of the plane", p.len() as f64 / 1e6 / best);
         dec.push(best);
     }
-    println!("decode planes 0 and 1   {:7.1} MB/s of the data (plane 2 stays raw)", mb / (dec[0] + dec[1]));
+    println!("decode plane 0          {:7.1} MB/s of the data (plane 1 stays raw)", mb / dec[0]);
     let mut out = vec![0u8; data.len()];
     let s = Instant::now();
     fineseed::split::merge(fineseed::split::F16, &planes, &mut out).expect("merge");

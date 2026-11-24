@@ -28,17 +28,17 @@ theorem bf16_bytes {lo hi : Nat} (hlo : lo < 256) (hhi : hi < 256) :
   simp only [bf16Enc]
   omega
 
-/-- F16 (value `x`): exponent (5 bits), sign with the top 2 mantissa bits, the low mantissa byte. -/
-def f16Enc (x : Nat) : Nat × Nat × Nat := (x / 1024 % 32, x / 32768 * 4 + x / 256 % 4, x % 256)
-def f16Dec (e s m : Nat) : Nat := s / 4 * 32768 + e * 1024 + s % 4 * 256 + m
+/-- F16 (value `x`): the high byte (sign, exponent, top 2 mantissa bits), then the low byte. -/
+def f16Enc (x : Nat) : Nat × Nat := (x / 256, x % 256)
+def f16Dec (h l : Nat) : Nat := h * 256 + l
 
 theorem f16_roundtrip {x : Nat} (hx : x < 65536) :
-    f16Dec (f16Enc x).1 (f16Enc x).2.1 (f16Enc x).2.2 = x := by
+    f16Dec (f16Enc x).1 (f16Enc x).2 = x := by
   simp only [f16Enc, f16Dec]
   omega
 
 theorem f16_bytes {x : Nat} (hx : x < 65536) :
-    (f16Enc x).1 < 256 ∧ (f16Enc x).2.1 < 256 ∧ (f16Enc x).2.2 < 256 := by
+    (f16Enc x).1 < 256 ∧ (f16Enc x).2 < 256 := by
   simp only [f16Enc]
   omega
 

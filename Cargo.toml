@@ -7,8 +7,16 @@ license = "MIT"
 
 [dependencies]
 blake3 = "1"
+crc32fast = "1"
+fuser = { version = "0.19", default-features = false, optional = true }
+reed-solomon-simd = "3"
 serde_json = "1"
 zstd = "0.14"
+
+[features]
+default = ["mount"]
+# `fineseed mount`: the archive as a read-only folder (FUSE; needs fusermount3 at run time)
+mount = ["dep:fuser"]
 
 [profile.release]
 opt-level = 3

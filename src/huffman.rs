@@ -8,9 +8,24 @@ const MAX_LEN: u32 = 15;
 pub const TABLE_BYTES: usize = 128;
 
 fn counts(data: &[u8]) -> [u64; 256] {
+    // four tables, so consecutive equal bytes (an exponent plane is mostly that) do not wait on one counter
     let mut c = [0u64; 256];
-    for &b in data {
-        c[b as usize] += 1;
+    // 2^32 would overflow a u32 counter: fold in slices well below that
+    for part in data.chunks(1 << 30) {
+        let mut t = [[0u32; 256]; 4];
+        let (quads, rest) = part.as_chunks::<4>();
+        for q in quads {
+            t[0][q[0] as usize] += 1;
+            t[1][q[1] as usize] += 1;
+            t[2][q[2] as usize] += 1;
+            t[3][q[3] as usize] += 1;
+        }
+        for &b in rest {
+            t[0][b as usize] += 1;
+        }
+        for s in 0..256 {
+            c[s] += u64::from(t[0][s]) + u64::from(t[1][s]) + u64::from(t[2][s]) + u64::from(t[3][s]);
+        }
     }
     c
 }
@@ -102,30 +117,70 @@ fn codes(len: &[u8; 256]) -> Option<[u16; 256]> {
     Some(out)
 }
 
+/// The code lengths for a plane and the size `encode_with` would give for it, from one pass over the plane.
+pub struct Table {
+    len: [u8; 256],
+    pub size: usize,
+}
+
+pub fn table(data: &[u8]) -> Table {
+    if data.is_empty() {
+        return Table {
+            len: [0; 256],
+            size: 0,
+        };
+    }
+    let c = counts(data);
+    let len = lengths(&c);
+    let bits: u64 = (0..256).map(|s| c[s] * u64::from(len[s])).sum();
+    Table {
+        len,
+        size: TABLE_BYTES + bits.div_ceil(8) as usize,
+    }
+}
+
 /// The coded bytes, or `None` for an empty plane.
 pub fn encode(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() {
         return None;
     }
-    let len = lengths(&counts(data));
-    let code = codes(&len)?;
-    let mut out = Vec::with_capacity(TABLE_BYTES + data.len() / 2);
+    encode_with(data, &table(data))
+}
+
+/// `encode` with the lengths `table(data)` already found.
+pub fn encode_with(data: &[u8], t: &Table) -> Option<Vec<u8>> {
+    if data.is_empty() {
+        return None;
+    }
+    let len = &t.len;
+    let code = codes(len)?;
+    let mut out = Vec::with_capacity(t.size.max(TABLE_BYTES) + 8);
     for pair in len.as_chunks::<2>().0 {
         out.push(pair[0] | pair[1] << 4);
     }
-    let (mut acc, mut bits) = (0u64, 0u32);
-    for &b in data {
-        let l = u32::from(len[b as usize]);
-        acc = acc << l | u64::from(code[b as usize]);
-        bits += l;
-        while bits >= 8 {
-            out.push((acc >> (bits - 8)) as u8);
-            bits -= 8;
-        }
-        acc &= (1 << bits) - 1;
+    // symbol code and length in one word, so the loop does one load per byte
+    let mut sym = [0u32; 256];
+    for s in 0..256 {
+        sym[s] = u32::from(code[s]) << 8 | u32::from(len[s]);
     }
-    if bits > 0 {
-        out.push((acc << (8 - bits)) as u8);
+    // the low `nb` bits of `acc` are pending; 32 of them are written at once
+    let (mut acc, mut nb) = (0u64, 0u32);
+    for &b in data {
+        let e = sym[b as usize];
+        let l = e & 0xff;
+        acc = acc << l | u64::from(e >> 8);
+        nb += l;
+        if nb >= 32 {
+            out.extend_from_slice(&((acc >> (nb - 32)) as u32).to_be_bytes());
+            nb -= 32;
+        }
+    }
+    while nb >= 8 {
+        out.push((acc >> (nb - 8)) as u8);
+        nb -= 8;
+    }
+    if nb > 0 {
+        out.push(((acc << (8 - nb)) & 0xff) as u8);
     }
     Some(out)
 }
@@ -156,39 +211,61 @@ pub fn decode(coded: &[u8], n: usize) -> Result<Vec<u8>, String> {
         table[lo..hi].fill((s as u16) << 4 | l as u16);
     }
     let stream = &coded[TABLE_BYTES..];
-    let mut out = Vec::with_capacity(n);
-    let (mut acc, mut bits, mut pos) = (0u64, 0u32, 0usize);
-    while out.len() < n {
-        while bits < MAX_LEN && pos < stream.len() {
-            acc = acc << 8 | u64::from(stream[pos]);
-            pos += 1;
-            bits += 8;
+    let mut out = vec![0u8; n];
+    // `buf` holds the next bits from its top; bits past `have` are the stream's next bits or zero
+    let (mut buf, mut have, mut pos, mut at) = (0u64, 0u32, 0usize, 0usize);
+    let mask = (1usize << MAX_LEN) - 1;
+    // fast: eight bytes in per refill leave at least 56 bits, so three symbols of at most 15 bits need no checks
+    while at + 3 <= n && pos + 8 <= stream.len() {
+        let w = u64::from_be_bytes([
+            stream[pos],
+            stream[pos + 1],
+            stream[pos + 2],
+            stream[pos + 3],
+            stream[pos + 4],
+            stream[pos + 5],
+            stream[pos + 6],
+            stream[pos + 7],
+        ]);
+        buf |= w >> have;
+        let adv = (63 - have) >> 3;
+        pos += adv as usize;
+        have += adv << 3;
+        let mut bad = 0u32;
+        for k in 0..3 {
+            let e = table[(buf >> (64 - MAX_LEN)) as usize & mask];
+            let l = u32::from(e & 15);
+            bad |= u32::from(l == 0);
+            buf <<= l;
+            have = have.wrapping_sub(l);
+            out[at + k] = (e >> 4) as u8;
         }
-        // past the end the stream reads as zero bits; a code that needs them is caught below
-        let window = if bits >= MAX_LEN {
-            (acc >> (bits - MAX_LEN)) as usize & ((1 << MAX_LEN) - 1)
-        } else {
-            ((acc << (MAX_LEN - bits)) as usize) & ((1 << MAX_LEN) - 1)
-        };
-        let e = table[window];
-        let l = u32::from(e & 15);
-        if l == 0 || l > bits {
+        if bad != 0 {
             return Err("huffman stream damaged or cut short".into());
         }
-        out.push((e >> 4) as u8);
-        bits -= l;
-        acc &= (1 << bits) - 1;
+        at += 3;
+    }
+    // slow: byte by byte, and a code longer than the bits left is an error
+    while at < n {
+        while have <= 56 && pos < stream.len() {
+            buf |= u64::from(stream[pos]) << (56 - have);
+            pos += 1;
+            have += 8;
+        }
+        let e = table[(buf >> (64 - MAX_LEN)) as usize & mask];
+        let l = u32::from(e & 15);
+        if l == 0 || l > have {
+            return Err("huffman stream damaged or cut short".into());
+        }
+        out[at] = (e >> 4) as u8;
+        at += 1;
+        buf <<= l;
+        have -= l;
     }
     Ok(out)
 }
 
 /// Size in bytes `encode` would give, from the counts alone (for choosing a method without coding twice).
 pub fn estimate(data: &[u8]) -> usize {
-    if data.is_empty() {
-        return 0;
-    }
-    let c = counts(data);
-    let len = lengths(&c);
-    let bits: u64 = (0..256).map(|s| c[s] * u64::from(len[s])).sum();
-    TABLE_BYTES + bits.div_ceil(8) as usize
+    table(data).size
 }

@@ -25,6 +25,8 @@
 //! original length `u64`, blake3 (32), block count `u32`, offset of its first block `u64`; a nested archive has no
 //! blocks and goes on with its zstd level `u8` and the number of its direct entries `u32`, which follow it.
 use super::*;
+use crate::pipe;
+pub mod access;
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -85,6 +87,12 @@ pub enum Node {
         hash: [u8; 32],
         children: Vec<Node>,
     },
+    /// Standard input, read once and cut into blocks as it comes; `kind` says what the bytes are when the caller
+    /// knows (`split::BF16` and so on), else each block is guessed.
+    Stream {
+        name: String,
+        kind: Option<u8>,
+    },
 }
 
 /// Files to store: `(archive name, path)`. A directory is walked, names start with its own name.
@@ -107,6 +115,10 @@ pub fn collect(paths: &[PathBuf]) -> Res<Vec<(String, PathBuf)>> {
     }
     let mut out = Vec::new();
     for p in paths {
+        if p == Path::new("-") {
+            out.push(("stdin".to_string(), p.clone()));
+            continue;
+        }
         let meta = io(
             std::fs::symlink_metadata(p),
             &format!("stat {}", p.display()),
@@ -232,6 +244,31 @@ fn flatten<'a>(nodes: &'a [Node], out: &mut Vec<&'a Node>) {
     }
 }
 
+/// How a run of `n` bytes starting at a block boundary is cut once a sample says it looks like `kind` with the first
+/// whole value at `shift`: a plain head, the values, a plain tail. `(length, kind)` pieces, none empty.
+fn auto_pieces(n: u64, kind: u8, shift: u64) -> Vec<(u64, u8)> {
+    let unit = split::unit(kind) as u64;
+    if kind == split::PLAIN || n <= shift {
+        return vec![(n, split::PLAIN)];
+    }
+    let body = (n - shift) / unit * unit;
+    [
+        (shift, split::PLAIN),
+        (body, kind),
+        (n - shift - body, split::PLAIN),
+    ]
+    .into_iter()
+    .filter(|p| p.0 > 0)
+    .collect()
+}
+
+/// The sample of a block of `n` bytes that decides its type: from the middle, at a multiple of 8 so the alignment
+/// found holds for the block start. `(offset in the block, length)`.
+fn auto_sample(n: u64) -> (u64, u64) {
+    let s = n.min(split::GUESS_SAMPLE as u64);
+    (((n - s) / 2) & !7, s)
+}
+
 /// Cut `[begin, end)` of a file whose layout is not read into blocks, each as the type a sample of it looks like.
 fn cut_auto(plans: &mut Vec<Plan>, f: &mut File, begin: u64, end: u64) -> Res<()> {
     let mut at = begin;
@@ -240,19 +277,12 @@ fn cut_auto(plans: &mut Vec<Plan>, f: &mut File, begin: u64, end: u64) -> Res<()
         if n < AUTO_MIN {
             cut(plans, at, at + n, split::PLAIN, None);
         } else {
-            // from the middle of the block, at a multiple of 8 so the alignment found holds for the block start
-            let s = n.min(split::GUESS_SAMPLE as u64);
-            let from = at + (((n - s) / 2) & !7);
-            let (kind, shift) = split::guess(&read_at(f, from, s)?);
-            let unit = split::unit(kind) as u64;
-            let shift = shift as u64;
-            if kind == split::PLAIN || n <= shift {
-                cut(plans, at, at + n, split::PLAIN, None);
-            } else {
-                let body = (n - shift) / unit * unit;
-                cut(plans, at, at + shift, split::PLAIN, None);
-                cut(plans, at + shift, at + shift + body, kind, None);
-                cut(plans, at + shift + body, at + n, split::PLAIN, None);
+            let (from, s) = auto_sample(n);
+            let (kind, shift) = split::guess(&read_at(f, at + from, s)?);
+            let mut p = at;
+            for (len, k) in auto_pieces(n, kind, shift as u64) {
+                cut(plans, p, p + len, k, None);
+                p += len;
             }
         }
         at += n;
@@ -260,7 +290,182 @@ fn cut_auto(plans: &mut Vec<Plan>, f: &mut File, begin: u64, end: u64) -> Res<()
     Ok(())
 }
 
-/// Write `nodes` as an archive. Pure: it opens no archive, so it is also how a nested one is built again.
+/// What one block came to: the coded block, or the earlier bytes it is a copy of.
+struct Done {
+    plan: Plan,
+    enc: Option<Encoded>,
+    dup: Option<(u32, u64)>,
+    key: [u8; 32],
+    data: Vec<u8>,
+}
+
+/// A block to code: its place and, for a stream that cannot be read again, its bytes.
+type Job = (Plan, Option<Vec<u8>>);
+
+/// What a member read from standard input comes out as: the blocks of 4 MiB read one after the other, each cut by a
+/// sample (or all as `kind` when the caller says what the bytes are).
+struct StreamJobs<R: Read> {
+    input: R,
+    at: u64,
+    kind: Option<u8>,
+    queue: std::collections::VecDeque<Job>,
+    done: bool,
+}
+
+impl<R: Read> Iterator for StreamJobs<R> {
+    type Item = Res<Job>;
+    fn next(&mut self) -> Option<Res<Job>> {
+        while self.queue.is_empty() && !self.done {
+            let mut chunk = vec![0u8; BLOCK as usize];
+            let mut have = 0usize;
+            while have < chunk.len() {
+                match self.input.read(&mut chunk[have..]) {
+                    Ok(0) => {
+                        self.done = true;
+                        break;
+                    }
+                    Ok(k) => have += k,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Some(Err(format!("read input: {e}"))),
+                }
+            }
+            chunk.truncate(have);
+            if have == 0 {
+                break;
+            }
+            let n = have as u64;
+            let pieces = match self.kind {
+                Some(k) => {
+                    let u = split::unit(k) as u64;
+                    let body = n / u * u;
+                    [(body, k), (n - body, split::PLAIN)]
+                        .into_iter()
+                        .filter(|p| p.0 > 0)
+                        .collect()
+                }
+                None if n < AUTO_MIN => vec![(n, split::PLAIN)],
+                None => {
+                    let (from, s) = auto_sample(n);
+                    let (kind, shift) =
+                        split::guess(&chunk[from as usize..(from + s) as usize]);
+                    auto_pieces(n, kind, shift as u64)
+                }
+            };
+            let mut p = 0usize;
+            for (len, k) in pieces {
+                let bytes = chunk[p..p + len as usize].to_vec();
+                self.queue.push_back((
+                    Plan {
+                        off: self.at + p as u64,
+                        len,
+                        kind: k,
+                        base: None,
+                    },
+                    Some(bytes),
+                ));
+                p += len as usize;
+            }
+            self.at += n;
+        }
+        self.queue.pop_front().map(Ok)
+    }
+}
+
+/// Code one member: its blocks go through the pipeline, are written in order, and the member's blake3 is taken on a
+/// thread of its own so neither hashing nor writing holds the coders up. Returns `(blake3, blocks, length)` and the
+/// blocks it added, `(key, offset, length)`, for the later members to copy from.
+#[allow(clippy::type_complexity)]
+fn code_member<W: Write, I: Iterator<Item = Res<Job>> + Send>(
+    out: &mut Count<W>,
+    rep: &mut Report,
+    jobs: I,
+    file: Option<&File>,
+    seen: &HashMap<[u8; 32], (u32, u64, u32)>,
+    open: &HashMap<u32, File>,
+    level: i32,
+) -> Res<([u8; 32], u32, u64, Vec<([u8; 32], u64, u32)>)> {
+    let threads = pipe::threads();
+    let mut fresh = Vec::new();
+    let (mut blocks, mut total) = (0u32, 0u64);
+    let (htx, hrx) = std::sync::mpsc::sync_channel::<Vec<u8>>(threads);
+    let (ran, digest) = std::thread::scope(|s| {
+        let hasher = s.spawn(move || {
+            let mut h = blake3::Hasher::new();
+            for d in hrx {
+                h.update(&d);
+            }
+            *h.finalize().as_bytes()
+        });
+        let ran = pipe::run(
+            threads,
+            2 * threads,
+            jobs,
+            |_, (plan, data): Job| -> Res<Done> {
+                let data = match data {
+                    Some(d) => d,
+                    None => pread(file.ok_or("a block without a file to read")?, plan.off, plan.len)?,
+                };
+                let key = *blake3::hash(&data).as_bytes();
+                let dup = seen
+                    .get(&key)
+                    .filter(|(_, _, l)| u64::from(*l) == plan.len)
+                    .map(|(m, o, _)| (*m, *o));
+                let enc = if dup.is_some() {
+                    None
+                } else {
+                    let base = match plan.base {
+                        Some((m, off)) => {
+                            let bf = open.get(&m).ok_or("a reference member is not open")?;
+                            Some(pread(bf, off, plan.len)?)
+                        }
+                        None => None,
+                    };
+                    Some(encode(&plan, &data, base.as_deref(), level)?)
+                };
+                Ok(Done {
+                    plan,
+                    enc,
+                    dup,
+                    key,
+                    data,
+                })
+            },
+            |_, d: Done| {
+                match &d.enc {
+                    Some(enc) => {
+                        write_member_block(out, enc, None)?;
+                        rep.xor_blocks += u32::from(enc.xor);
+                    }
+                    None => {
+                        let enc = Encoded {
+                            kind: d.plan.kind,
+                            xor: false,
+                            off: d.plan.off,
+                            len: d.plan.len as u32,
+                            base_member: 0,
+                            base_off: 0,
+                            parts: Vec::new(),
+                        };
+                        write_member_block(out, &enc, d.dup)?;
+                        rep.dup_blocks += 1;
+                    }
+                }
+                fresh.push((d.key, d.plan.off, d.plan.len as u32));
+                blocks += 1;
+                total += d.plan.len;
+                htx.send(d.data).map_err(|_| "the hashing thread stopped".to_string())
+            },
+        );
+        drop(htx);
+        (ran, hasher.join())
+    });
+    ran?;
+    let digest = digest.map_err(|_| "the hashing thread panicked".to_string())?;
+    Ok((digest, blocks, total, fresh))
+}
+
+/// Write `nodes` as an archive (to standard output when `output` is `-`). Pure: it opens no archive, so it is also
+/// how a nested one is built again.
 fn write_archive(nodes: &[Node], output: &Path, level: i32) -> Res<Report> {
     if !(1..=22).contains(&level) {
         return Err("the level is 1 to 22".into());
@@ -272,11 +477,16 @@ fn write_archive(nodes: &[Node], output: &Path, level: i32) -> Res<Report> {
         .iter()
         .map(|n| match n {
             Node::File { path, .. } => Some(path.as_path()),
-            Node::Nest { .. } => None,
+            _ => None,
         })
         .collect();
+    let sink: Box<dyn Write> = if output == Path::new("-") {
+        Box::new(std::io::stdout().lock())
+    } else {
+        Box::new(io(File::create(output), "create output")?)
+    };
     let mut out = Count {
-        inner: BufWriter::new(io(File::create(output), "create output")?),
+        inner: BufWriter::with_capacity(1 << 20, sink),
         n: 0,
     };
     io(out.write_all(AMAGIC), "write")?;
@@ -306,6 +516,34 @@ fn write_archive(nodes: &[Node], output: &Path, level: i32) -> Res<Report> {
                 rep.nested += 1;
                 continue;
             }
+            Node::Stream { name, kind } => {
+                let body = out.n;
+                let jobs = StreamJobs {
+                    input: std::io::stdin(),
+                    at: 0,
+                    kind: *kind,
+                    queue: Default::default(),
+                    done: false,
+                };
+                let (hash, blocks, len, fresh) =
+                    code_member(&mut out, &mut rep, jobs, None, &seen, &open, level)?;
+                for (k, off, l) in fresh {
+                    seen.entry(k).or_insert((i as u32, off, l));
+                }
+                rep.blocks += blocks;
+                rep.original += len;
+                rep.members += 1;
+                table.push(Member {
+                    name: name.clone(),
+                    len,
+                    hash,
+                    blocks,
+                    body,
+                    depth: 0,
+                    nest: None,
+                });
+                continue;
+            }
             Node::File { name, path } => (name, path),
         };
         let mut f = io(File::open(path), &format!("open {}", path.display()))?;
@@ -325,76 +563,10 @@ fn write_archive(nodes: &[Node], output: &Path, level: i32) -> Res<Report> {
         }
         cut_auto(&mut plans, &mut f, pos, len)?;
         let body = out.n;
-        let mut hasher = blake3::Hasher::new();
-        let mut fresh: Vec<([u8; 32], u64, u32)> = Vec::new();
-        for batch in plans.chunks(workers()) {
-            let (mut data, mut bases, mut keys, mut dups) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            for plan in batch {
-                let d = read_at(&mut f, plan.off, plan.len)?;
-                hasher.update(&d);
-                let key = *blake3::hash(&d).as_bytes();
-                let dup = seen
-                    .get(&key)
-                    .filter(|(_, _, l)| u64::from(*l) == plan.len)
-                    .map(|(m, o, _)| (*m, *o));
-                let b = match (plan.base, dup) {
-                    (Some((m, off)), None) => {
-                        let bf = open.get_mut(&m).ok_or("a reference member is not open")?;
-                        Some(read_at(bf, off, plan.len)?)
-                    }
-                    _ => None,
-                };
-                data.push(d);
-                bases.push(b);
-                keys.push(key);
-                dups.push(dup);
-            }
-            let encoded: Vec<Res<Option<Encoded>>> = std::thread::scope(|s| {
-                let handles: Vec<_> = batch
-                    .iter()
-                    .zip(&data)
-                    .zip(&bases)
-                    .zip(&dups)
-                    .map(|(((plan, d), b), dup)| {
-                        s.spawn(move || {
-                            if dup.is_some() {
-                                Ok(None)
-                            } else {
-                                encode(plan, d, b.as_deref(), level).map(Some)
-                            }
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_else(|_| Err("a worker panicked".into())))
-                    .collect()
-            });
-            for (k, e) in encoded.into_iter().enumerate() {
-                let plan = &batch[k];
-                match e? {
-                    Some(enc) => {
-                        write_member_block(&mut out, &enc, None)?;
-                        rep.xor_blocks += u32::from(enc.xor);
-                    }
-                    None => {
-                        let enc = Encoded {
-                            kind: plan.kind,
-                            xor: false,
-                            off: plan.off,
-                            len: plan.len as u32,
-                            base_member: 0,
-                            base_off: 0,
-                            parts: Vec::new(),
-                        };
-                        write_member_block(&mut out, &enc, dups[k])?;
-                        rep.dup_blocks += 1;
-                    }
-                }
-                fresh.push((keys[k], plan.off, plan.len as u32));
-            }
-        }
+        let count = plans.len() as u32;
+        let jobs = plans.into_iter().map(|p| Ok((p, None)));
+        let (hash, _, _, fresh) =
+            code_member(&mut out, &mut rep, jobs, Some(&f), &seen, &open, level)?;
         for (k, off, l) in fresh {
             seen.entry(k).or_insert((i as u32, off, l));
         }
@@ -405,14 +577,14 @@ fn write_archive(nodes: &[Node], output: &Path, level: i32) -> Res<Report> {
                 list.remove(0);
             }
         }
-        rep.blocks += plans.len() as u32;
+        rep.blocks += count;
         rep.original += len;
         rep.members += 1;
         table.push(Member {
             name: name.clone(),
             len,
-            hash: *hasher.finalize().as_bytes(),
-            blocks: plans.len() as u32,
+            hash,
+            blocks: count,
             body,
             depth: 0,
             nest: None,
@@ -503,11 +675,28 @@ fn expand(path: &Path, name: &str, tmp: &Path, counter: &mut u32) -> Res<Option<
 /// Store `files` in `output`. `level` is the zstd level, 1 to 22. A file that is a `.fseed` is opened (see the
 /// module doc).
 pub fn store(files: &[(String, PathBuf)], output: &Path, level: i32) -> Res<Report> {
+    store_as(files, output, level, None)
+}
+
+/// `store`, where a file named `-` is standard input and `kind` (if any) is what its bytes are.
+pub fn store_as(
+    files: &[(String, PathBuf)],
+    output: &Path,
+    level: i32,
+    kind: Option<u8>,
+) -> Res<Report> {
     let tmp = PathBuf::from(format!("{}.tmp", output.display()));
     let mut counter = 0u32;
     let mut nodes = Vec::new();
     let built = (|| -> Res<Report> {
         for (name, path) in files {
+            if path == Path::new("-") {
+                nodes.push(Node::Stream {
+                    name: name.clone(),
+                    kind,
+                });
+                continue;
+            }
             nodes.push(match expand(path, name, &tmp, &mut counter)? {
                 Some(n) => n,
                 None => Node::File {
@@ -546,7 +735,8 @@ fn walk(t: &mut [Member], at: &mut usize, count: u32, depth: u32) -> Res<()> {
 }
 
 fn read_table(f: &mut File) -> Res<Table> {
-    let total = io(f.metadata(), "stat")?.len();
+    // the archive proper: what a parity trailer (`parity`) follows is not part of it
+    let total = crate::parity::archive_len(f)?;
     if total < (AMAGIC.len() * 2 + 12) as u64 {
         return Err("not a fineseed archive".into());
     }
@@ -707,83 +897,93 @@ struct Ctx {
 }
 
 /// Restore the blocks of file entry `i` to `target`; its blake3 is checked as soon as it is written.
+///
+/// The blocks are parsed one after the other (that is a sequential read of the archive anyway), decoded on every
+/// core, and written in order while a thread of its own hashes what was written.
 fn restore_file(ctx: &mut Ctx, i: usize, target: &Path) -> Res<()> {
     let m = ctx.table[i].clone();
     io(ctx.f.seek(SeekFrom::Start(m.body)), "seek")?;
     let mut rd = BufReader::with_capacity(1 << 20, io(ctx.f.try_clone(), "clone")?);
     let mut out = BufWriter::with_capacity(1 << 20, io(File::create(target), "create member")?);
-    let mut open: HashMap<u32, File> = HashMap::new();
-    let mut hasher = blake3::Hasher::new();
-    let (mut written, mut left) = (0u64, m.blocks);
-    while left > 0 {
-        let n = (left as usize).min(workers());
-        let mut blks = Vec::new();
-        for _ in 0..n {
-            blks.push(read_member_block(&mut rd)?);
+    let paths = &ctx.paths;
+    let rep = &mut ctx.rep;
+    let files: std::sync::Mutex<HashMap<u32, std::sync::Arc<File>>> = Default::default();
+    let earlier = |j: u32| -> Res<std::sync::Arc<File>> {
+        let path = paths
+            .get(j as usize)
+            .and_then(|p| p.as_ref())
+            .filter(|_| (j as usize) < i)
+            .ok_or("a block refers to a member that is not restored yet")?;
+        let mut g = files.lock().map_err(|_| "a worker panicked")?;
+        if g.len() > 48 {
+            g.clear();
         }
-        let mut sides = Vec::new();
-        for b in &blks {
-            let src = match (b.dup, b.raw.xor) {
-                (Some(d), _) => Some(d),
-                (None, true) => Some((b.base_member, b.raw.base_off)),
-                _ => None,
-            };
-            sides.push(match src {
-                Some((j, off)) => {
-                    let path = ctx
-                        .paths
-                        .get(j as usize)
-                        .and_then(|p| p.as_ref())
-                        .filter(|_| (j as usize) < i)
-                        .ok_or("a block refers to a member that is not restored yet")?;
-                    if let std::collections::hash_map::Entry::Vacant(v) = open.entry(j) {
-                        v.insert(io(File::open(path), "open an earlier member")?);
-                    }
-                    let sf = open.get_mut(&j).ok_or("an earlier member is not open")?;
-                    Some(read_at(sf, off, b.raw.len as u64)?)
-                }
-                None => None,
-            });
+        if let Some(f) = g.get(&j) {
+            return Ok(f.clone());
         }
-        let decoded: Vec<Res<Vec<u8>>> = std::thread::scope(|s| {
-            let handles: Vec<_> = blks
-                .iter()
-                .zip(&sides)
-                .map(|(b, side)| {
-                    s.spawn(move || match (&b.dup, side) {
-                        (Some(_), Some(bytes)) => Ok(bytes.clone()),
-                        _ => decode(&b.raw, side.as_deref()),
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Err("a worker panicked".into())))
-                .collect()
-        });
-        for (b, d) in blks.iter().zip(decoded) {
-            if b.raw.off != written {
-                return Err("blocks out of order".into());
+        let f = std::sync::Arc::new(io(File::open(path), "open an earlier member")?);
+        g.insert(j, f.clone());
+        Ok(f)
+    };
+    let threads = pipe::threads();
+    let (mut written, mut seen) = (0u64, 0u32);
+    let (htx, hrx) = std::sync::mpsc::sync_channel::<Vec<u8>>(threads);
+    let (ran, digest) = std::thread::scope(|s| {
+        let hasher = s.spawn(move || {
+            let mut h = blake3::Hasher::new();
+            for d in hrx {
+                h.update(&d);
             }
-            let d = d?;
-            hasher.update(&d);
-            io(out.write_all(&d), "write")?;
-            written += d.len() as u64;
-            ctx.rep.dup_blocks += u32::from(b.dup.is_some());
-            ctx.rep.xor_blocks += u32::from(b.raw.xor);
-        }
-        left -= n as u32;
-    }
+            *h.finalize().as_bytes()
+        });
+        let jobs = (0..m.blocks).map(|_| read_member_block(&mut rd));
+        let ran = pipe::run(
+            threads,
+            2 * threads,
+            jobs,
+            |_, b: Blk| -> Res<(Vec<u8>, u64, bool, bool)> {
+                let src = match (b.dup, b.raw.xor) {
+                    (Some(d), _) => Some(d),
+                    (None, true) => Some((b.base_member, b.raw.base_off)),
+                    _ => None,
+                };
+                let side = match src {
+                    Some((j, off)) => Some(pread(&*earlier(j)?, off, b.raw.len as u64)?),
+                    None => None,
+                };
+                let bytes = match (b.dup.is_some(), side) {
+                    (true, Some(copy)) => copy,
+                    (_, side) => decode(&b.raw, side.as_deref())?,
+                };
+                Ok((bytes, b.raw.off, b.dup.is_some(), b.raw.xor))
+            },
+            |_, (bytes, off, dup, xor): (Vec<u8>, u64, bool, bool)| {
+                if off != written {
+                    return Err("blocks out of order".to_string());
+                }
+                io(out.write_all(&bytes), "write")?;
+                written += bytes.len() as u64;
+                rep.dup_blocks += u32::from(dup);
+                rep.xor_blocks += u32::from(xor);
+                seen += 1;
+                htx.send(bytes).map_err(|_| "the hashing thread stopped".to_string())
+            },
+        );
+        drop(htx);
+        (ran, hasher.join())
+    });
+    ran?;
+    let digest = digest.map_err(|_| "the hashing thread panicked".to_string())?;
     io(out.flush(), "flush")?;
-    if written != m.len || hasher.finalize().as_bytes() != &m.hash {
+    if written != m.len || seen != m.blocks || digest != m.hash {
         return Err(format!(
             "{}: the restored bytes differ from the original (blake3 mismatch)",
             m.name
         ));
     }
-    ctx.rep.members += 1;
-    ctx.rep.original += m.len;
-    ctx.rep.blocks += m.blocks;
+    rep.members += 1;
+    rep.original += m.len;
+    rep.blocks += m.blocks;
     Ok(())
 }
 

@@ -177,33 +177,63 @@ pub fn split(kind: u8, data: &[u8]) -> Vec<Vec<u8>> {
     match kind {
         1 => out[0].extend_from_slice(data),
         2..=8 => {
-            for v in data.chunks_exact(u) {
+            for o in out.iter_mut() {
+                o.resize(n, 0);
+            }
+            for (i, v) in data.chunks_exact(u).enumerate() {
                 for (k, b) in v.iter().enumerate() {
-                    out[k].push(*b);
+                    out[k][i] = *b;
                 }
             }
         }
         BF16 => {
-            for v in data.as_chunks::<2>().0 {
-                out[0].push(v[1] << 1 | v[0] >> 7);
-                out[1].push(v[1] & 0x80 | v[0] & 0x7f);
+            let [a, b] = out.get_disjoint_mut([0, 1]).unwrap_or_else(|_| unreachable!());
+            a.resize(n, 0);
+            b.resize(n, 0);
+            for ((v, e), s) in data.as_chunks::<2>().0.iter().zip(a.iter_mut()).zip(b.iter_mut()) {
+                *e = v[1] << 1 | v[0] >> 7;
+                *s = v[1] & 0x80 | v[0] & 0x7f;
             }
         }
         F16 => {
-            for v in data.as_chunks::<2>().0 {
+            let [a, b, c] = out.get_disjoint_mut([0, 1, 2]).unwrap_or_else(|_| unreachable!());
+            a.resize(n, 0);
+            b.resize(n, 0);
+            c.resize(n, 0);
+            for (((v, e), s), m) in data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(a.iter_mut())
+                .zip(b.iter_mut())
+                .zip(c.iter_mut())
+            {
                 let x = u16::from_le_bytes(*v);
-                out[0].push((x >> 10 & 0x1f) as u8);
-                out[1].push((x >> 15 << 2 | x >> 8 & 3) as u8);
-                out[2].push(x as u8);
+                *e = (x >> 10 & 0x1f) as u8;
+                *s = (x >> 15 << 2 | x >> 8 & 3) as u8;
+                *m = x as u8;
             }
         }
         F32 => {
-            for v in data.as_chunks::<4>().0 {
+            let [a, b, c, d] = out.get_disjoint_mut([0, 1, 2, 3]).unwrap_or_else(|_| unreachable!());
+            a.resize(n, 0);
+            b.resize(n, 0);
+            c.resize(n, 0);
+            d.resize(n, 0);
+            for ((((v, e), s), m1), m0) in data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(a.iter_mut())
+                .zip(b.iter_mut())
+                .zip(c.iter_mut())
+                .zip(d.iter_mut())
+            {
                 let x = u32::from_le_bytes(*v);
-                out[0].push((x >> 23) as u8);
-                out[1].push((x >> 31 << 7 | x >> 16 & 0x7f) as u8);
-                out[2].push((x >> 8) as u8);
-                out[3].push(x as u8);
+                *e = (x >> 23) as u8;
+                *s = (x >> 31 << 7 | x >> 16 & 0x7f) as u8;
+                *m1 = (x >> 8) as u8;
+                *m0 = x as u8;
             }
         }
         k => {
@@ -244,47 +274,56 @@ pub fn split(kind: u8, data: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// The inverse of `split`: `streams` as `split` made them, `out` the whole block. `Err` when the streams do not fit.
-pub fn merge(kind: u8, streams_in: &[Vec<u8>], out: &mut [u8]) -> Result<(), String> {
+pub fn merge<S: AsRef<[u8]>>(kind: u8, streams_in: &[S], out: &mut [u8]) -> Result<(), String> {
+    let st: Vec<&[u8]> = streams_in.iter().map(|s| s.as_ref()).collect();
     let u = unit(kind);
     if u == 0 || !out.len().is_multiple_of(u) {
         return Err("a block of an unknown kind or an odd length".into());
     }
     let n = out.len() / u;
     let want = lens(kind, n);
-    if streams_in.len() != want.len() || streams_in.iter().zip(&want).any(|(s, l)| s.len() != *l) {
+    if st.len() != want.len() || st.iter().zip(&want).any(|(s, l)| s.len() != *l) {
         return Err("streams of the wrong number or length".into());
     }
     match kind {
-        1 => out.copy_from_slice(&streams_in[0]),
+        1 => out.copy_from_slice(&st[0]),
         2..=8 => {
             for (i, v) in out.chunks_exact_mut(u).enumerate() {
                 for (k, b) in v.iter_mut().enumerate() {
-                    *b = streams_in[k][i];
+                    *b = st[k][i];
                 }
             }
         }
         BF16 => {
-            for (i, v) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-                let (e, s) = (streams_in[0][i], streams_in[1][i]);
+            for ((v, &e), &s) in out.as_chunks_mut::<2>().0.iter_mut().zip(st[0]).zip(st[1]) {
                 v[1] = s & 0x80 | e >> 1;
                 v[0] = (e & 1) << 7 | s & 0x7f;
             }
         }
         F16 => {
-            for (i, v) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-                let (e, s, m) = (
-                    u16::from(streams_in[0][i]),
-                    u16::from(streams_in[1][i]),
-                    u16::from(streams_in[2][i]),
-                );
+            for (((v, &e), &s), &m) in out
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(st[0])
+                .zip(st[1])
+                .zip(st[2])
+            {
+                let (e, s, m) = (u16::from(e), u16::from(s), u16::from(m));
                 *v = (s >> 2 << 15 | e << 10 | (s & 3) << 8 | m).to_le_bytes();
             }
         }
         F32 => {
-            for (i, v) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let e = u32::from(streams_in[0][i]);
-                let s = u32::from(streams_in[1][i]);
-                let (m1, m0) = (u32::from(streams_in[2][i]), u32::from(streams_in[3][i]));
+            for ((((v, &e), &s), &m1), &m0) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(st[0])
+                .zip(st[1])
+                .zip(st[2])
+                .zip(st[3])
+            {
+                let (e, s, m1, m0) = (u32::from(e), u32::from(s), u32::from(m1), u32::from(m0));
                 *v = (s >> 7 << 31 | e << 23 | (s & 0x7f) << 16 | m1 << 8 | m0).to_le_bytes();
             }
         }
@@ -296,7 +335,7 @@ pub fn merge(kind: u8, streams_in: &[Vec<u8>], out: &mut [u8]) -> Result<(), Str
                     Planes(off, len) => {
                         for (i, b) in out.chunks_exact_mut(q.bytes).enumerate() {
                             for j in 0..len {
-                                b[off + j] = streams_in[at + j][i];
+                                b[off + j] = st[at + j][i];
                             }
                         }
                         at += len;
@@ -304,7 +343,7 @@ pub fn merge(kind: u8, streams_in: &[Vec<u8>], out: &mut [u8]) -> Result<(), Str
                     Bytes(off, len) => {
                         for (i, b) in out.chunks_exact_mut(q.bytes).enumerate() {
                             b[off..off + len]
-                                .copy_from_slice(&streams_in[at][i * len..(i + 1) * len]);
+                                .copy_from_slice(&st[at][i * len..(i + 1) * len]);
                         }
                         at += 1;
                     }
@@ -312,8 +351,8 @@ pub fn merge(kind: u8, streams_in: &[Vec<u8>], out: &mut [u8]) -> Result<(), Str
                         for (i, b) in out.chunks_exact_mut(q.bytes).enumerate() {
                             for j in 0..len {
                                 let (lo, hi) = (
-                                    streams_in[at][(i * len + j) * 2],
-                                    streams_in[at][(i * len + j) * 2 + 1],
+                                    st[at][(i * len + j) * 2],
+                                    st[at][(i * len + j) * 2 + 1],
                                 );
                                 if lo > 15 || hi > 15 {
                                     return Err("a nibble stream with a symbol above 15".into());

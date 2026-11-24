@@ -71,7 +71,7 @@ fn merge_refuses_wrong_streams_and_nibbles_above_fifteen() {
     let last = parts.len() - 1;
     parts[last][3] = 16;
     assert!(split::merge(kind, &parts, &mut out).is_err());
-    assert!(split::merge(0, &[], &mut []).is_err());
+    assert!(split::merge(0, &[] as &[Vec<u8>], &mut []).is_err());
 }
 
 fn kv_string(out: &mut Vec<u8>, key: &str, value: &str) {

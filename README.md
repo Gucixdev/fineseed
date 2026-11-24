@@ -18,21 +18,25 @@ fineseed pack all.fseed new-model.gguf -o more.fseed # an .fseed is opened: its 
 fineseed list more.fseed                             # every entry, nested ones indented
 fineseed unpack more.fseed -o out/                   # every file, nested archives built again, each checked
 fineseed check more.fseed                            # unpack to a scratch folder, verify, delete it
+fineseed cat more.fseed models/a.gguf > a.gguf       # one entry to stdout, nothing else is decoded
+fineseed extract more.fseed models/a.gguf -o out/    # some entries (a folder or nested archive takes all under it)
+fineseed mount more.fseed /mnt/models                # read-only folder, a read decodes only what it touches
+fineseed protect more.fseed --parity 5               # Reed-Solomon parity behind the archive; scrub checks, repair fixes
+cat kv.bin | fineseed pack - --dtype bf16 -o kv.fseed  # a stream, no temp file
 ```
 
 `-l N` sets the zstd level (1 to 22, default 3). Quantizing is not what this does: it only compresses.
-
 ## What it does
 
 * **Formats.** SafeTensors, GGUF (v2, v3) and ONNX (initializers) are read tensor by tensor, with bounds on every length.
-  Every other file (TensorFlow data files, TFLite, a PyTorch zip, npz, anything) is cut into blocks and each block is coded as
+  Zip containers (DDUF, PyTorch) are opened and each stored entry is read as a file of its own. Every other file (TensorFlow data files, TFLite, npz, anything) is cut into blocks and each block is coded as
   bfloat16, float16, float32 or plain bytes, whichever a 16 KiB sample of it says (a fast zstd stands in for the coder, so
   text and code are not mistaken for weights). It still comes back exact, and a file that is not a model costs only the look.
 * **Split by what the bytes are.** BF16, F16 and F32 are cut so the exponent sits apart from the mantissa, integers by byte
   plane, and every quantized ggml type this knows (Q4_0 to Q8_0, the K-quants Q2_K to Q6_K, the IQ types and TQ1_0/TQ2_0) by its fields (scales, mins, nibbles). A wrong
   guess only costs ratio, never correctness: the split is bijective and every byte is covered exactly once.
-* **Own Huffman coder** next to zstd and "stored raw": the smallest of the three wins per stream.
-* **Against a base.** Each tensor is also tried as `block XOR block of the most similar earlier tensor`.
+* **Own Huffman coder** next to zstd and "stored raw" (smallest wins per stream); each tensor is also tried as
+  `block XOR block of the most similar earlier tensor`.
 * **Archive of many models.** `pack` keeps a block identical to an earlier one (from any member, any format) only once, and
   codes a tensor against the most similar earlier tensor of the same type and size, from any earlier member. So a GGUF of a
   model already in the archive as SafeTensors costs almost nothing. The table of contents is at the end; `list` reads only that.
@@ -40,10 +44,15 @@ fineseed check more.fseed                            # unpack to a scratch folde
   and references with everything else (a model that sits in two inner archives is stored once). Unpack builds the inner file again
   byte for byte; packing proves it can (it builds every inner archive again and compares), and an inner file that would not
   come back identical, because another version wrote it, is kept as plain bytes instead. Up to 16 levels.
+* **Random access.** `cat`, `extract` and `mount` (FUSE, feature `mount`, needs `fusermount3`; a nested `.fseed` is a folder)
+  read the table at the end, then only the blocks a read needs.
+* **Streams.** `pack -` reads standard input in 4 MiB pieces (typed by a sample or `--dtype`), `-o -` writes to standard
+  output. A KV cache dump is split like any BF16/F16/F32 data; nothing KV-specific.
+* **Bitrot.** `protect` appends Reed-Solomon parity (groups of 128 pieces of 64 KiB, a CRC32 per piece); `repair` rewrites
+  damaged pieces in place, each only after it matches its CRC. The header at the very end is not protected.
 * **Library.** `fineseed::api` is bytes in, bytes out (`compress`/`decompress` for a whole file, `encode_block`/`decode_block`
   for one tensor with an optional reference), no files and no global state, hostile input gives an `Error`, never a panic.
-* **Proofs.** `lean4/` proves the split, merge, XOR and block cutting round-trip, and runs the Rust code against the Lean
-  oracle through the devframework differential test (see `lean4/README.md`).
+* **Proofs.** `lean4/` proves split, merge, XOR and block cutting round-trip and diffs the Rust code against the Lean oracle.
 
 ## Measured
 
@@ -78,10 +87,8 @@ same model, a model that is in two folders); for unrelated models it is exactly 
 Pack times for these three were 402 s, 509 s and 742 s.
 
 ## Not done yet
-
-Extracting one member without restoring the others, random access into a packed file, a mantissa-given-exponent context coder
-for the last half point on BF16, readers for the formats' own metadata (TFLite and TensorFlow index files) so their tensors are cut
-exactly instead of found by sampling.
+A mantissa-given-exponent context coder for BF16, anything KV-cache specific, FP8 splitting (no ratio gain), "bonsai" (not
+identified), readers for TFLite and TensorFlow index files so their tensors are cut exactly instead of found by sampling.
 
 ## Build and test
 
@@ -90,4 +97,4 @@ cargo build --release
 cargo test --release
 ```
 
-Rust 2024, dependencies: `blake3`, `serde_json`, `zstd`.
+Rust 2024, dependencies: `blake3`, `serde_json`, `zstd`, `crc32fast`, `reed-solomon-simd`, `fuser` (for `mount`, optional).

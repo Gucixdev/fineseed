@@ -17,10 +17,15 @@ pub mod archive;
 pub mod format;
 pub mod gguf;
 pub mod huffman;
+#[cfg(feature = "mount")]
+pub mod mount;
 pub mod onnx;
+pub mod parity;
+pub mod pipe;
 pub mod planes;
 pub mod safetensors;
 pub mod split;
+pub mod zip;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -82,14 +87,22 @@ fn workers() -> usize {
     workers_for(0)
 }
 
-/// `0` = one per core (at most 6: a batch of blocks is held in memory), else the number asked for.
+/// `0` = one per core (at most 32), else the number asked for.
 fn workers_for(threads: usize) -> usize {
     if threads > 0 {
         return threads.min(64);
     }
     std::thread::available_parallelism()
         .map_or(2, |n| n.get())
-        .clamp(1, 6)
+        .clamp(1, 32)
+}
+
+/// `len` bytes at `off` without moving any cursor, so several threads can read one file.
+fn pread(file: &File, off: u64, len: u64) -> Res<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; len as usize];
+    io(file.read_exact_at(&mut buf, off), "read")?;
+    Ok(buf)
 }
 
 fn read_at<R: Read + Seek>(file: &mut R, off: u64, len: u64) -> Res<Vec<u8>> {
@@ -100,7 +113,8 @@ fn read_at<R: Read + Seek>(file: &mut R, off: u64, len: u64) -> Res<Vec<u8>> {
 }
 
 fn code_plane(plane: &[u8], level: i32, plain: bool) -> Res<Part> {
-    let est = huffman::estimate(plane);
+    let table = huffman::table(plane);
+    let est = table.size;
     // an order-0 coder that gains almost nothing means noise, and zstd will not find more in noise; plain blocks
     // (text, metadata) keep the zstd attempt because matches, not symbol counts, are what it finds there
     let mut best = Part {
@@ -119,7 +133,7 @@ fn code_plane(plane: &[u8], level: i32, plain: bool) -> Res<Part> {
         }
     }
     if est < best_len
-        && let Some(h) = huffman::encode(plane).filter(|h| h.len() < best_len)
+        && let Some(h) = huffman::encode_with(plane, &table).filter(|h| h.len() < best_len)
     {
         best = Part {
             method: 2,
@@ -415,10 +429,10 @@ fn decode(raw: &Raw, base: Option<&[u8]>) -> Res<Vec<u8>> {
     let lens = split::lens(raw.kind, raw.len / split::unit(raw.kind));
     let mut streams = Vec::with_capacity(raw.parts.len());
     for ((method, bytes), want) in raw.parts.iter().zip(&lens) {
-        let s = match method {
-            0 => bytes.clone(),
-            1 => io(zstd::bulk::decompress(bytes, *want), "unzstd")?,
-            2 => huffman::decode(bytes, *want)?,
+        let s: std::borrow::Cow<[u8]> = match method {
+            0 => std::borrow::Cow::Borrowed(bytes.as_slice()),
+            1 => io(zstd::bulk::decompress(bytes, *want), "unzstd")?.into(),
+            2 => huffman::decode(bytes, *want)?.into(),
             _ => return Err("an unknown part method".into()),
         };
         if s.len() != *want {

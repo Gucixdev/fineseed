@@ -904,7 +904,7 @@ fn restore_file(ctx: &mut Ctx, i: usize, target: &Path) -> Res<()> {
     let m = ctx.table[i].clone();
     io(ctx.f.seek(SeekFrom::Start(m.body)), "seek")?;
     let mut rd = BufReader::with_capacity(1 << 20, io(ctx.f.try_clone(), "clone")?);
-    let mut out = BufWriter::with_capacity(1 << 20, io(File::create(target), "create member")?);
+    let out = io(File::create(target), "create member")?;
     let paths = &ctx.paths;
     let rep = &mut ctx.rep;
     let files: std::sync::Mutex<HashMap<u32, std::sync::Arc<File>>> = Default::default();
@@ -955,13 +955,15 @@ fn restore_file(ctx: &mut Ctx, i: usize, target: &Path) -> Res<()> {
                     (true, Some(copy)) => copy,
                     (_, side) => decode(&b.raw, side.as_deref())?,
                 };
+                // each worker writes its own block where it belongs: one writer at the end of the pipeline
+                // was the floor of the whole unpack (page cache fill, 2 GB/s) however many cores there were
+                io(std::os::unix::fs::FileExt::write_all_at(&out, &bytes, b.raw.off), "write")?;
                 Ok((bytes, b.raw.off, b.dup.is_some(), b.raw.xor))
             },
             |_, (bytes, off, dup, xor): (Vec<u8>, u64, bool, bool)| {
                 if off != written {
                     return Err("blocks out of order".to_string());
                 }
-                io(out.write_all(&bytes), "write")?;
                 written += bytes.len() as u64;
                 rep.dup_blocks += u32::from(dup);
                 rep.xor_blocks += u32::from(xor);
@@ -974,7 +976,6 @@ fn restore_file(ctx: &mut Ctx, i: usize, target: &Path) -> Res<()> {
     });
     ran?;
     let digest = digest.map_err(|_| "the hashing thread panicked".to_string())?;
-    io(out.flush(), "flush")?;
     if written != m.len || seen != m.blocks || digest != m.hash {
         return Err(format!(
             "{}: the restored bytes differ from the original (blake3 mismatch)",

@@ -11,12 +11,20 @@ crc32fast = "1"
 fuser = { version = "0.19", default-features = false, optional = true }
 reed-solomon-simd = "3"
 serde_json = "1"
+pollster = { version = "1", optional = true }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"], optional = true }
 zstd = "0.14"
 
 [features]
 default = ["mount"]
 # `fineseed mount`: the archive as a read-only folder (FUSE; needs fusermount3 at run time)
 mount = ["dep:fuser"]
+# `fineseed::gpu`: chunked Huffman parts decoded on the GPU (wgpu, Vulkan); off by default, nothing else uses it
+gpu = ["dep:wgpu", "dep:pollster"]
+
+[[example]]
+name = "gpu_huff"
+required-features = ["gpu"]
 
 [profile.release]
 opt-level = 3

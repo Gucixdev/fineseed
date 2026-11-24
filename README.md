@@ -86,10 +86,10 @@ core, and a spinning disk is the limit. `RUSTFLAGS="-C target-cpu=native"` makes
   proves split, merge, XOR and block cutting round-trip and diffs the Rust code against the Lean oracle.
 
 ## Not done
-A mantissa-given-exponent context coder for BF16; anything KV-cache specific (a KV dump is just a stream split by dtype);
-FP8 splitting (no gain); TFLite and TensorFlow index readers (their tensors are found by sampling). The parity header
-(a few KiB at the end of a protected file) is detected when damaged but cannot be repaired. `mount` shows a nested `.fseed`
-as a folder.
+A mantissa-given-exponent context coder for BF16; anything KV-cache specific; FP8 splitting (no gain); TFLite and
+TensorFlow index readers. The parity header cannot be repaired. `mount` shows a nested `.fseed` as a folder. **GPU:**
+`--features gpu` decodes the Huffman chunks with wgpu (Vulkan), checked against the CPU. On a GTX 1050 Ti it does 1 to
+1.5 GB/s of one plane with the transfers, so 12 CPU threads beat it, and no command uses it yet.
 
 ## Build and test
 ```

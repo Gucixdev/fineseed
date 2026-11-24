@@ -233,7 +233,7 @@ fn encode_one(data: &[u8], sym: &[u32; 256]) -> Vec<u8> {
 /// (four dependency chains instead of one) and a GPU can give each to a thread.
 pub const CHUNK: usize = 1 << 14;
 
-fn read_lengths(coded: &[u8]) -> Result<[u8; 256], String> {
+pub(crate) fn read_lengths(coded: &[u8]) -> Result<[u8; 256], String> {
     if coded.len() < TABLE_BYTES {
         return Err("huffman table cut short".into());
     }
@@ -245,14 +245,14 @@ fn read_lengths(coded: &[u8]) -> Result<[u8; 256], String> {
     Ok(len)
 }
 
-const TABLE_LEN: usize = 1 << MAX_LEN;
+pub(crate) const TABLE_LEN: usize = 1 << MAX_LEN;
 /// An entry no code points at: one bit long and marked, so a step still moves on and the marker is read afterwards.
 const UNUSED: u16 = 1 << 12 | 1;
 
 /// The decoding table, indexed by the longest code in use, not by 15 bits: a mantissa plane needs 9 or 10 and the
 /// part of the table that is read then stays in the L1 cache. Entry = symbol << 4 | length, `UNUSED` for no code.
 /// Its size is fixed so that the index (masked with `TABLE_LEN - 1`) needs no bounds check.
-fn decoding_table(len: &[u8; 256]) -> Result<(Box<[u16; TABLE_LEN]>, u32), String> {
+pub(crate) fn decoding_table(len: &[u8; 256]) -> Result<(Box<[u16; TABLE_LEN]>, u32), String> {
     let code = codes(len).ok_or("huffman lengths overfill the code space")?;
     let top = u32::from(len.iter().copied().max().unwrap_or(1)).max(1);
     let mut table: Box<[u16; TABLE_LEN]> = vec![0u16; TABLE_LEN]
@@ -381,29 +381,40 @@ pub fn encode_chunked(data: &[u8], t: &Table) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The inverse of `encode_chunked`: exactly `n` bytes, or an error on a damaged table or stream.
-pub fn decode_chunked(coded: &[u8], n: usize) -> Result<Vec<u8>, String> {
-    let (table, top) = decoding_table(&read_lengths(coded)?)?;
+/// Where each chunk's stream sits in a part made by `encode_chunked`: byte offsets (start, end) into `coded`.
+pub(crate) fn chunk_ranges(coded: &[u8], n: usize) -> Result<Vec<(usize, usize)>, String> {
     let count = n.div_ceil(CHUNK);
     let head = TABLE_BYTES + 4 * count;
     if coded.len() < head {
         return Err("huffman chunk lengths cut short".into());
     }
     let mut at = head;
-    let mut out = vec![0u8; n];
-    let mut lanes = Vec::with_capacity(count);
-    for (i, dst) in out.chunks_mut(CHUNK).enumerate() {
+    let mut ranges = Vec::with_capacity(count);
+    for i in 0..count {
         let l = u32::from_le_bytes(coded[TABLE_BYTES + 4 * i..][..4].try_into().unwrap_or([0; 4])) as usize;
         let end = at
             .checked_add(l)
             .filter(|&e| e <= coded.len())
             .ok_or("a huffman chunk runs past the part")?;
-        lanes.push(Lane::new(&coded[at..end], dst));
+        ranges.push((at, end));
         at = end;
     }
     if at != coded.len() {
         return Err("a huffman part has bytes after its last chunk".into());
     }
+    Ok(ranges)
+}
+
+/// The inverse of `encode_chunked`: exactly `n` bytes, or an error on a damaged table or stream.
+pub fn decode_chunked(coded: &[u8], n: usize) -> Result<Vec<u8>, String> {
+    let (table, top) = decoding_table(&read_lengths(coded)?)?;
+    let ranges = chunk_ranges(coded, n)?;
+    let mut out = vec![0u8; n];
+    let mut lanes: Vec<Lane> = out
+        .chunks_mut(CHUNK)
+        .zip(&ranges)
+        .map(|(dst, &(a, b))| Lane::new(&coded[a..b], dst))
+        .collect();
     let per = per_step(top);
     for group in lanes.chunks_mut(4) {
         if let [a, b, c, d] = group {

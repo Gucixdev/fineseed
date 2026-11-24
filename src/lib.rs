@@ -15,6 +15,8 @@
 pub mod api;
 pub mod archive;
 pub mod format;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod gguf;
 pub mod huffman;
 #[cfg(feature = "mount")]
